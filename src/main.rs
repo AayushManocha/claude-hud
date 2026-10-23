@@ -1,3 +1,4 @@
+mod ansi;
 mod config;
 mod dashboard;
 mod discover;

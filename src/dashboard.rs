@@ -48,6 +48,8 @@ struct App {
     picker: Option<Picker>,
     peek: bool,
     peek_text: String,
+    /// Same capture with colour codes, for display only.
+    peek_ansi: String,
     /// Fingerprint of the dialog the user is currently looking at in the peek.
     seen: Option<(String, String)>,
     /// When `seen` last changed; decisions right after a change are refused.
@@ -126,6 +128,7 @@ impl App {
             picker: None,
             peek: true,
             peek_text: String::new(),
+            peek_ansi: String::new(),
             seen: None,
             seen_at: Instant::now(),
             input: None,
@@ -263,7 +266,7 @@ impl App {
             self.repos = r;
         }
         if self.grid {
-            self.tiles = self.entries.iter().map(|e| (e.a.pane_id.clone(), tmux::capture(&e.a.pane_id, 40))).collect();
+            self.tiles = self.entries.iter().map(|e| (e.a.pane_id.clone(), tmux::capture_ansi(&e.a.pane_id, 40))).collect();
         }
         self.rows = model::build(&self.entries, &self.repos, &self.pinned, &self.toggled, &self.filter);
         let idx = self
@@ -302,6 +305,10 @@ impl App {
         let pane = self.selected_entry().map(|e| e.a.pane_id.clone());
         self.peek_text = match (self.peek && !self.grid, &pane) {
             (true, Some(p)) => tmux::capture(p, interact::CAPTURE_LINES),
+            _ => String::new(),
+        };
+        self.peek_ansi = match (self.peek && !self.grid, &pane) {
+            (true, Some(p)) => tmux::capture_ansi(p, interact::CAPTURE_LINES),
             _ => String::new(),
         };
         let seen = pane.and_then(|p| interact::parse(&self.peek_text).map(|d| (p, d.fingerprint)));
@@ -649,12 +656,15 @@ impl App {
             };
             let block = panel().title(title);
             let inner = block.inner(peek);
-            let lines: Vec<&str> = self.peek_text.trim_end().lines().collect();
-            let tail = lines[lines.len().saturating_sub(inner.height as usize)..].join("\n");
+            let mut lines = crate::ansi::lines(&self.peek_ansi);
+            while lines.last().is_some_and(|l| l.spans.iter().all(|s| s.content.trim().is_empty())) {
+                lines.pop();
+            }
             let body_text = if lines.is_empty() {
                 Paragraph::new("\n  select an agent to peek at its pane").style(Style::new().fg(FAINT))
             } else {
-                Paragraph::new(tail).style(Style::new().fg(TEXT))
+                let skip = lines.len().saturating_sub(inner.height as usize);
+                Paragraph::new(lines.split_off(skip))
             };
             f.render_widget(body_text.block(block), peek);
         }
@@ -747,12 +757,13 @@ impl App {
                 Span::styled(format!(" {} {name} ", e.a.status.glyph()), Style::new().fg(color))
             };
             let text = self.tiles.get(&e.a.pane_id).map(String::as_str).unwrap_or("");
-            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            let mut lines = crate::ansi::lines(text);
+            lines.retain(|l| l.spans.iter().any(|s| !s.content.trim().is_empty()));
             let h = cell.height.saturating_sub(2) as usize;
-            let tail = lines[lines.len().saturating_sub(h)..].join("\n");
+            let tail = lines.split_off(lines.len().saturating_sub(h));
             let border = if selected { Style::new().fg(color) } else { Style::new().fg(FAINT) };
             f.render_widget(
-                Paragraph::new(tail).style(Style::new().fg(TEXT)).block(
+                Paragraph::new(tail).block(
                     Block::bordered()
                         .border_type(if selected { BorderType::Thick } else { BorderType::Rounded })
                         .border_style(border)

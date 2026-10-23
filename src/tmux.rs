@@ -76,3 +76,13 @@ pub fn capture(pane_id: &str, lines: usize) -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default()
 }
+
+/// Like `capture`, but keeps ANSI colour codes (`-e`) so the preview matches the pane.
+pub fn capture_ansi(pane_id: &str, lines: usize) -> String {
+    let start = format!("-{lines}");
+    Command::new("tmux")
+        .args(["capture-pane", "-p", "-e", "-t", pane_id, "-S", &start])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
