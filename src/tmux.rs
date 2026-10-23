@@ -6,7 +6,7 @@ pub struct PaneInfo {
     pub session: String,
     pub window_id: String,
     pub window_name: String,
-    /// `worktree` | `chat` (window option `@hud_kind`; falls back to a `chat:` name prefix)
+    /// `worktree` | `chat` (option `@hud_kind`, set on the session; falls back to a `chat:` name prefix)
     pub kind: String,
 }
 

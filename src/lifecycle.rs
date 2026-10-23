@@ -25,33 +25,48 @@ pub struct NewWindow<'a> {
     pub launch: bool,
 }
 
-/// Create a tagged window in the client's session, start `claude` in it, focus it.
-pub fn open_window(client: Option<&str>, w: &NewWindow) -> Result<()> {
-    let mut disp = vec!["display-message", "-p"];
-    if let Some(c) = client {
-        disp.extend(["-c", c]);
-    }
-    disp.push("#{session_name}");
-    let session = tmux_out(&disp).context("tmux not reachable (run inside tmux)")?;
+/// tmux session names can't contain `.` or `:`.
+fn session_name(name: &str) -> String {
+    name.replace(['.', ':'], "-")
+}
 
-    let target = format!("{session}:");
+/// `base`, or `base-2`, `base-3`… if a session by that name already exists.
+fn unique_session(base: &str) -> String {
+    let mut name = base.to_string();
+    let mut n = 1;
+    while crate::tmux::run(&["has-session", "-t", &format!("={name}")]) {
+        n += 1;
+        name = format!("{base}-{n}");
+    }
+    name
+}
+
+/// Create a tagged, detached session with one window, start `claude` in it
+/// if asked, and switch the client to it.
+pub fn open_window(client: Option<&str>, w: &NewWindow) -> Result<()> {
+    let name = unique_session(&session_name(w.name));
     let cwd = w.cwd.display().to_string();
     let created = tmux_out(&[
-        "new-window", "-d", "-P", "-F", "#{window_id} #{pane_id}",
-        "-t", &target, "-n", w.name, "-c", &cwd,
+        "new-session", "-d", "-P", "-F", "#{session_id} #{window_id} #{pane_id}",
+        "-s", &name, "-n", w.name, "-c", &cwd,
     ])
-    .context("tmux new-window failed")?;
-    let (win, pane) = created.split_once(' ').context("unexpected tmux output")?;
+    .context("tmux new-session failed")?;
+    let mut f = created.split(' ');
+    let (sess, win, pane) = (f.next().unwrap_or(""), f.next().unwrap_or(""), f.next().unwrap_or(""));
+    if pane.is_empty() {
+        bail!("unexpected tmux output");
+    }
 
+    // Session options: the `#{@hud_*}` formats resolve them for the session's panes.
     for (k, v) in [("@hud_kind", Some(w.kind)), ("@hud_repo", w.repo), ("@hud_path", Some(cwd.as_str()))] {
         if let Some(v) = v {
-            crate::tmux::run(&["set-option", "-w", "-t", win, k, v]);
+            crate::tmux::run(&["set-option", "-t", sess, k, v]);
         }
     }
     if w.launch {
         crate::tmux::run(&["send-keys", "-t", pane, &config::claude_cmd(), "Enter"]);
     }
-    focus(client, &session, win);
+    focus(client, sess, win);
     Ok(())
 }
 
@@ -63,22 +78,24 @@ fn focus(client: Option<&str>, session: &str, window_id: &str) {
     crate::tmux::run(&["select-window", "-t", window_id]);
 }
 
-/// Window already tagged for this worktree path, if any: (session, window id).
+/// Session tagged (at session level) for this worktree path, if any: (session id, first window id).
+/// `#{@hud_path}` in a format would also match a legacy window-level tag via the
+/// session's active window, so read the session's own option instead.
 fn find_window(path: &Path) -> Option<(String, String)> {
-    let out = tmux_out(&["list-windows", "-a", "-F", "#{session_name}\t#{window_id}\t#{@hud_path}"])?;
     let want = path.display().to_string();
-    out.lines().find_map(|l| {
-        let mut f = l.split('\t');
-        let (s, w, p) = (f.next()?, f.next()?, f.next()?);
-        (p == want).then(|| (s.to_string(), w.to_string()))
-    })
+    let sess = tmux_out(&["list-sessions", "-F", "#{session_id}"])?.lines().find_map(|id| {
+        let p = tmux_out(&["show-options", "-qv", "-t", id, "@hud_path"])?;
+        (p == want).then(|| id.to_string())
+    })?;
+    let win = tmux_out(&["list-windows", "-t", &sess, "-F", "#{window_id}"])?.lines().next()?.to_string();
+    Some((sess, win))
 }
 
 pub fn window_name(repo: &str, wt: &Worktree) -> String {
     format!("{repo}/{}", wt.branch.as_deref().unwrap_or("detached"))
 }
 
-/// Open (or focus the existing window for) a worktree, as a plain shell.
+/// Open (or switch to the existing session for) a worktree, as a plain shell.
 pub fn open_worktree(client: Option<&str>, repo: &Repo, wt: &Worktree) -> Result<()> {
     if let Some((s, w)) = find_window(&wt.path) {
         focus(client, &s, &w);
