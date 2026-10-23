@@ -2,7 +2,7 @@ use crate::discover::{self, Repo};
 use crate::interact::{self, Decision};
 use crate::model::{self, Entry, Key, Kind, Row};
 use crate::state::{self, Status};
-use crate::{config, lifecycle, sync, tmux};
+use crate::{config, lifecycle, sync, tmux, usage};
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -65,6 +65,7 @@ struct App {
     seen_at: Instant,
     input: Option<(InputKind, String)>,
     confirm: Option<Confirm>,
+    usage: Option<usage::Usage>,
     msg: Option<(Result<String, String>, Instant)>,
     list: ListState,
     sel: Option<Key>,
@@ -115,7 +116,8 @@ fn age(secs: u64) -> String {
     match secs {
         0..=59 => format!("{secs}s"),
         60..=3599 => format!("{}m", secs / 60),
-        _ => format!("{}h", secs / 3600),
+        3600..=86399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
     }
 }
 
@@ -152,6 +154,7 @@ impl App {
             seen_at: Instant::now(),
             input: None,
             confirm: None,
+            usage: None,
             msg: None,
             list: ListState::default(),
             sel: None,
@@ -288,6 +291,7 @@ impl App {
         if self.grid {
             self.tiles = self.entries.iter().map(|e| (e.a.pane_id.clone(), tmux::capture_ansi(&e.a.pane_id, 40))).collect();
         }
+        self.usage = usage::load();
         self.rows = model::build(&self.entries, &self.repos, &self.pinned, &self.toggled, &self.filter);
         let idx = self
             .sel
@@ -656,7 +660,10 @@ impl App {
             title.push(Span::styled(format!("  {} {n}", s.glyph()), st));
             title.push(Span::styled(format!(" {word}"), if n == 0 { Style::new().fg(FAINT) } else { dim() }));
         }
-        f.render_widget(Line::from(title), head);
+        let title_w = title.iter().map(|s| s.content.chars().count()).sum::<usize>() as u16;
+        let [head_l, head_r] = Layout::horizontal([Constraint::Length(title_w), Constraint::Min(0)]).areas(head);
+        f.render_widget(Line::from(title), head_l);
+        f.render_widget(Line::from(self.usage_spans(head_r.width as usize)).right_aligned(), head_r);
 
         if self.grid {
             self.render_grid(f, main);
@@ -760,6 +767,32 @@ impl App {
 
         self.render_footer(f, foot);
         self.render_picker(f);
+    }
+
+    /// Plan limits for the header's right edge; empty if there's no room.
+    fn usage_spans(&self, width: usize) -> Vec<Span<'static>> {
+        let Some(u) = &self.usage else {
+            let hint = "limits: run cc-hud install --write ";
+            return if width > hint.len() { vec![Span::styled(hint, Style::new().fg(YELLOW))] } else { vec![] };
+        };
+        let now = state::now();
+        let mut spans = vec![];
+        for w in &u.windows {
+            let color = if w.pct >= 85.0 { RED } else if w.pct >= 60.0 { YELLOW } else { GREEN };
+            let filled = ((w.pct / 20.0).round() as usize).min(5);
+            spans.push(Span::styled(format!("{} ", w.label), dim()));
+            spans.push(Span::styled("█".repeat(filled), Style::new().fg(color)));
+            spans.push(Span::styled("░".repeat(5 - filled), Style::new().fg(FAINT)));
+            spans.push(Span::styled(format!(" {:.0}%", w.pct), Style::new().fg(color)));
+            spans.push(Span::styled(format!(" ↻{}   ", age(w.resets_at.saturating_sub(now))), dim()));
+        }
+        // The numbers are as of a session's last response; say so when that's a while ago.
+        let stale = now.saturating_sub(u.updated);
+        if stale > 300 {
+            spans.push(Span::styled(format!("({} old) ", age(stale)), Style::new().fg(FAINT)));
+        }
+        let w: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        if w > width { vec![] } else { spans }
     }
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {

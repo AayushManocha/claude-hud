@@ -15,6 +15,7 @@ mod status;
 mod sync;
 mod state;
 mod tmux;
+mod usage;
 
 use clap::{Parser, Subcommand};
 
@@ -89,6 +90,12 @@ enum Cmd {
     },
     /// Attach to (or create) the workspace tmux session rooted at the root directory
     Open,
+    /// Claude Code status line command: records plan usage limits for the dashboard,
+    /// then runs --then (your previous status line) with the same input
+    Statusline {
+        #[arg(long)]
+        then: Option<String>,
+    },
     /// Refresh per-window status glyphs now
     Sync,
     /// Add the hooks to Claude Code settings (dry run unless --write)
@@ -157,6 +164,7 @@ fn main() -> anyhow::Result<()> {
             sync::run();
             Ok(())
         }
+        Cmd::Statusline { then } => usage::statusline(then),
         Cmd::Install { write, settings } => install::run(write, settings),
     }
 }

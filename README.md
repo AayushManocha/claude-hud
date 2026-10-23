@@ -21,6 +21,8 @@ Already have a tmux config? Point your agent at [TMUX_SETUP.md](TMUX_SETUP.md) a
 Start a workspace with `cc-hud open` (attach-or-create session `dev` rooted at the root dir).
 Restart running Claude sessions so they pick up the hooks.
 
+`install` also routes Claude Code's status line through `cc-hud statusline`, which records your plan usage limits (5h / 7d, Pro and Max) for the dashboard header. Your existing status line command keeps running behind it unchanged. Limits update after each Claude response, and show "(Nm old)" when no session has reported for a while.
+
 ## Keys (after the tmux prefix)
 
 | key | |
@@ -34,7 +36,7 @@ Dashboard: `enter`/`space` jump/open, `a` allow once, `d` deny, `r` reply, `w` n
 
 ## CLI
 
-`cc-hud list|status|next|sync|repos|open`, `cc-hud new worktree <repo> <branch>`,
+`cc-hud list|status|next|sync|repos|open|statusline`, `cc-hud new worktree <repo> <branch>`,
 `cc-hud new chat <topic> [--cwd DIR]`.
 
 ## tmux options
