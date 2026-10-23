@@ -34,9 +34,28 @@ pub fn notify_mode() -> String {
     setting("CC_HUD_NOTIFY", "@claude-hud-notify").unwrap_or_else(|| "tmux".into())
 }
 
-/// Repo names always shown, even without agents (`@claude-hud-projects`, comma-separated).
-pub fn projects() -> Vec<String> {
+/// Repo names pinned in tmux config (`@claude-hud-projects`, comma-separated).
+pub fn config_pins() -> Vec<String> {
     setting("CC_HUD_PROJECTS", "@claude-hud-projects")
         .map(|v| v.split(',').map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).collect())
         .unwrap_or_default()
+}
+
+fn pins_file() -> PathBuf {
+    crate::state::state_dir().join("pinned")
+}
+
+/// Repo names pinned from the dashboard (one per line).
+pub fn saved_pins() -> Vec<String> {
+    std::fs::read_to_string(pins_file())
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+pub fn save_pins(pins: &[String]) -> std::io::Result<()> {
+    let f = pins_file();
+    if let Some(dir) = f.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(f, pins.join("\n") + "\n")
 }

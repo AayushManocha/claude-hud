@@ -8,7 +8,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -23,6 +23,12 @@ enum InputKind {
     Chat(PathBuf),
 }
 
+/// Fuzzy repo picker for pinning (`P`).
+struct Picker {
+    query: String,
+    sel: usize,
+}
+
 struct App {
     client: Option<String>,
     entries: Vec<Entry>,
@@ -35,7 +41,11 @@ struct App {
     tiles: HashMap<String, String>,
     filter: String,
     typing: bool,
+    /// Pins from tmux config (read-only here) and pins saved from the dashboard.
+    config_pins: Vec<String>,
+    saved_pins: Vec<String>,
     pinned: Vec<String>,
+    picker: Option<Picker>,
     peek: bool,
     peek_text: String,
     /// Fingerprint of the dialog the user is currently looking at in the peek.
@@ -110,7 +120,10 @@ impl App {
             tiles: HashMap::new(),
             filter: String::new(),
             typing: false,
-            pinned: config::projects(),
+            pinned: vec![],
+            config_pins: config::config_pins(),
+            saved_pins: config::saved_pins(),
+            picker: None,
             peek: true,
             peek_text: String::new(),
             seen: None,
@@ -121,8 +134,117 @@ impl App {
             sel: None,
             quit: false,
         };
+        a.pinned = a.all_pins();
         a.refresh();
         a
+    }
+
+    fn all_pins(&self) -> Vec<String> {
+        let mut v = self.config_pins.clone();
+        v.extend(self.saved_pins.iter().cloned());
+        v
+    }
+
+    /// Discovered repos matching the picker query, by name.
+    fn picker_matches(&self) -> Vec<usize> {
+        let q = self.picker.as_ref().map(|p| p.query.as_str()).unwrap_or("");
+        let mut v: Vec<usize> = (0..self.repos.len()).filter(|&i| model::fuzzy(q, &self.repos[i].name)).collect();
+        v.sort_by_key(|&i| self.repos[i].name.to_lowercase());
+        v
+    }
+
+    fn on_picker_key(&mut self, k: KeyEvent) {
+        let Some(p) = self.picker.as_mut() else { return };
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Esc => self.picker = None,
+            KeyCode::Down => p.sel += 1,
+            KeyCode::Char('n') if ctrl => p.sel += 1,
+            KeyCode::Up => p.sel = p.sel.saturating_sub(1),
+            KeyCode::Char('p') if ctrl => p.sel = p.sel.saturating_sub(1),
+            KeyCode::Backspace => {
+                p.query.pop();
+                p.sel = 0;
+            }
+            KeyCode::Char(c) if !ctrl => {
+                p.query.push(c);
+                p.sel = 0;
+            }
+            KeyCode::Enter => self.toggle_pin(),
+            _ => {}
+        }
+    }
+
+    fn toggle_pin(&mut self) {
+        let m = self.picker_matches();
+        let Some(&ri) = self.picker.as_ref().and_then(|p| m.get(p.sel.min(m.len().saturating_sub(1)))) else { return };
+        let name = self.repos[ri].name.clone();
+        if self.config_pins.contains(&name) {
+            return self.say(Err(format!("{name} is pinned in tmux config (@claude-hud-projects)")));
+        }
+        let was = self.saved_pins.contains(&name);
+        if was {
+            self.saved_pins.retain(|n| n != &name);
+        } else {
+            self.saved_pins.push(name.clone());
+        }
+        match config::save_pins(&self.saved_pins) {
+            Ok(()) => {
+                self.pinned = self.all_pins();
+                self.say(Ok(format!("{} {name}", if was { "unpinned" } else { "pinned" })));
+                self.refresh();
+            }
+            Err(e) => self.say(Err(format!("saving pins: {e}"))),
+        }
+    }
+
+    fn render_picker(&self, f: &mut Frame) {
+        let Some(p) = &self.picker else { return };
+        let a = f.area();
+        let (w, h) = (a.width.min(60), a.height.min(20));
+        let area = Rect::new(a.x + (a.width - w) / 2, a.y + (a.height - h) / 2, w, h);
+        f.render_widget(Clear, area);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(ACCENT))
+            .title(Span::styled(" pin repos ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)))
+            .title_bottom(Line::from(Span::styled(" ⏎ toggle · esc close ", dim())).right_aligned());
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let [q, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+        f.render_widget(
+            Line::from(vec![
+                Span::styled(" ", Style::new().fg(ACCENT)),
+                Span::styled(p.query.clone(), Style::new().fg(TEXT)),
+                Span::styled("▏", Style::new().fg(ACCENT)),
+            ]),
+            q,
+        );
+        let m = self.picker_matches();
+        let items: Vec<ListItem> = m
+            .iter()
+            .map(|&i| {
+                let n = &self.repos[i].name;
+                let (mark, note) = if self.config_pins.contains(n) {
+                    ("★", "  (config)")
+                } else if self.saved_pins.contains(n) {
+                    ("★", "")
+                } else {
+                    (" ", "")
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {mark} "), Style::new().fg(YELLOW)),
+                    Span::styled(n.clone(), Style::new().fg(TEXT)),
+                    Span::styled(note, dim()),
+                ]))
+            })
+            .collect();
+        if items.is_empty() {
+            f.render_widget(Paragraph::new("  no matching repos").style(dim()), list);
+        } else {
+            let mut st = ListState::default().with_selected(Some(p.sel.min(items.len() - 1)));
+            f.render_stateful_widget(List::new(items).highlight_style(Style::new().bg(SURFACE).add_modifier(Modifier::BOLD)), list, &mut st);
+        }
     }
 
     /// Reload state from disk/tmux, keeping the selection on the same row.
@@ -350,6 +472,10 @@ impl App {
             self.quit = true;
             return;
         }
+        if self.picker.is_some() {
+            self.on_picker_key(k);
+            return;
+        }
         if let Some((_, buf)) = self.input.as_mut() {
             match k.code {
                 KeyCode::Enter => self.submit_input(),
@@ -390,6 +516,7 @@ impl App {
                 self.grid = !self.grid;
                 self.refresh();
             }
+            KeyCode::Char('P') => self.picker = Some(Picker { query: String::new(), sel: 0 }),
             KeyCode::Char('w') => self.start_worktree(),
             KeyCode::Char('c') => self.start_chat(),
             KeyCode::Char('h') | KeyCode::Left if self.grid => self.move_agent(-1),
@@ -433,6 +560,7 @@ impl App {
         if self.grid {
             self.render_grid(f, main);
             self.render_footer(f, foot);
+            self.render_picker(f);
             return;
         }
         let now = state::now();
@@ -532,6 +660,7 @@ impl App {
         }
 
         self.render_footer(f, foot);
+        self.render_picker(f);
     }
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {
@@ -571,7 +700,7 @@ impl App {
         } else {
             let keys = [
                 ("⏎", "jump"), ("a", "allow"), ("d", "deny"), ("r", "reply"), ("w", "worktree"), ("c", "chat"),
-                ("m", "grid"), ("/", "filter"), ("tab", "fold"), ("p", "peek"), ("n", "next"), ("q", "quit"),
+                ("P", "pin"), ("m", "grid"), ("/", "filter"), ("tab", "fold"), ("p", "peek"), ("n", "next"), ("q", "quit"),
             ];
             let mut spans = vec![];
             for (k, d) in keys {
