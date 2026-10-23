@@ -16,6 +16,8 @@ set -g @claude-hud-root '~/Developer'      # scanned for repos (2 levels deep)
 run-shell ~/Developer/claude-hud/claude-hud.tmux
 ```
 
+Already have a tmux config? Point your agent at [TMUX_SETUP.md](TMUX_SETUP.md) and it will wire this in without clobbering anything.
+
 Start a workspace with `cc-hud open` (attach-or-create session `dev` rooted at the root dir).
 Restart running Claude sessions so they pick up the hooks.
 
