@@ -8,6 +8,8 @@ pub struct PaneInfo {
     pub window_name: String,
     /// `worktree` | `chat` (option `@hud_kind`, set on the session; falls back to a `chat:` name prefix)
     pub kind: String,
+    /// What a chat is about (option `@hud_topic`, set at creation); empty for older chats.
+    pub topic: String,
 }
 
 /// Run one tmux invocation; extra commands are chained with a `;` argument.
@@ -25,7 +27,7 @@ pub fn live_panes() -> Option<HashMap<String, PaneInfo>> {
             "list-panes",
             "-a",
             "-F",
-            "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_name}\t#{@hud_kind}",
+            "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_name}\t#{@hud_kind}\t#{@hud_topic}",
         ])
         .output()
         .ok()?;
@@ -43,6 +45,7 @@ pub fn live_panes() -> Option<HashMap<String, PaneInfo>> {
                     window_id: f.next()?.to_string(),
                     window_name: f.next()?.to_string(),
                     kind: f.next().unwrap_or("").to_string(),
+                    topic: f.next().unwrap_or("").to_string(),
                 },
             ))
         })

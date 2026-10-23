@@ -40,6 +40,25 @@ pub fn group_of(e: &Entry) -> String {
     }
 }
 
+/// What a chat is about: the topic it was created with, else the agent's task,
+/// else the session name. Never the window name, which tmux sets from the cwd.
+pub fn chat_title(e: &Entry) -> String {
+    let first = |s: &str| s.lines().next().unwrap_or("").trim().to_string();
+    [first(&e.p.topic), e.a.task.as_deref().map(first).unwrap_or_default()]
+        .into_iter()
+        .find(|s| !s.is_empty())
+        .unwrap_or_else(|| e.p.session.trim_start_matches("chat-").to_string())
+}
+
+/// Short row label: a chat's title, or a worktree's branch.
+pub fn label(e: &Entry) -> String {
+    if e.p.is_chat() {
+        chat_title(e)
+    } else {
+        e.a.branch.clone().unwrap_or_else(|| e.p.window_name.clone())
+    }
+}
+
 fn urgency(s: Status) -> u8 {
     match s {
         Status::NeedsInput => 2,
@@ -63,7 +82,7 @@ fn haystack(e: &Entry) -> String {
         "{} {} {} {}",
         group_of(e),
         e.a.branch.as_deref().unwrap_or(""),
-        e.p.window_name,
+        if e.p.is_chat() { chat_title(e) } else { e.p.window_name.clone() },
         e.a.task.as_deref().unwrap_or("")
     )
 }
@@ -182,6 +201,7 @@ mod tests {
             p: PaneInfo {
                 session: "dev".into(), window_id: win.into(), window_name: branch.into(),
                 kind: if chat { "chat".into() } else { "".into() },
+                topic: String::new(),
             },
         }
     }
@@ -266,6 +286,20 @@ mod tests {
         assert_eq!(labels(&rows), ["G:dots(folded)"]);
         let open: HashSet<String> = ["dots"].map(String::from).into();
         assert_eq!(labels(&build(&[], &repos, &pinned, &open, "")), ["G:dots", "W:0"]);
+    }
+
+    #[test]
+    fn chat_title_prefers_topic_then_task_then_session() {
+        let mut e = entry("%0", "@0", "r", "b", Status::Idle, true);
+        e.p.window_name = "Developer".into(); // tmux renamed it to the cwd
+        e.p.session = "chat-ideas".into();
+        e.a.task = Some("brainstorm onboarding\nmore".into());
+        assert_eq!(chat_title(&e), "brainstorm onboarding");
+        e.p.topic = "launch plan".into();
+        assert_eq!(chat_title(&e), "launch plan");
+        e.p.topic.clear();
+        e.a.task = None;
+        assert_eq!(chat_title(&e), "ideas");
     }
 
     #[test]

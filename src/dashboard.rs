@@ -55,6 +55,8 @@ struct App {
     /// When `seen` last changed; decisions right after a change are refused.
     seen_at: Instant,
     input: Option<(InputKind, String)>,
+    /// Worktree awaiting a y/n answer before removal: (repo name, path, prompt label).
+    confirm: Option<(String, PathBuf, String)>,
     msg: Option<(Result<String, String>, Instant)>,
     list: ListState,
     sel: Option<Key>,
@@ -81,6 +83,15 @@ fn status_color(s: Status) -> Color {
 fn status_style(s: Status) -> Style {
     let st = Style::new().fg(status_color(s));
     if s == Status::NeedsInput { st.add_modifier(Modifier::BOLD) } else { st }
+}
+
+/// Truncate to `n` chars with an ellipsis.
+fn fit(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        s.chars().take(n.saturating_sub(1)).chain(['…']).collect()
+    }
 }
 
 fn dim() -> Style {
@@ -132,6 +143,7 @@ impl App {
             seen: None,
             seen_at: Instant::now(),
             input: None,
+            confirm: None,
             msg: None,
             list: ListState::default(),
             sel: None,
@@ -378,6 +390,51 @@ impl App {
         }
     }
 
+    /// The linked worktree under the selection: a worktree row, or an agent running inside one.
+    /// Never the main checkout.
+    fn selected_worktree(&self) -> Option<(usize, usize)> {
+        let (ri, dir) = match &self.rows.get(self.list.selected()?)?.kind {
+            Kind::Worktree { repo, wt } => return Some((*repo, *wt)).filter(|&(r, w)| self.repos[r].worktrees[w].path != self.repos[r].path),
+            Kind::Agent { entry, .. } => {
+                let e = &self.entries[*entry];
+                if e.p.is_chat() {
+                    return None;
+                }
+                let name = model::group_of(e);
+                let ri = self.repos.iter().position(|r| r.name == name)?;
+                (ri, std::fs::canonicalize(&e.a.cwd).unwrap_or_else(|_| PathBuf::from(&e.a.cwd)))
+            }
+            Kind::Group { .. } => return None,
+        };
+        let repo = &self.repos[ri];
+        let wi = (0..repo.worktrees.len())
+            .filter(|&w| dir.starts_with(&repo.worktrees[w].path))
+            .max_by_key(|&w| repo.worktrees[w].path.as_os_str().len())?;
+        (repo.worktrees[wi].path != repo.path).then_some((ri, wi))
+    }
+
+    fn start_remove(&mut self) {
+        let Some((ri, wi)) = self.selected_worktree() else {
+            return self.say(Err("select a linked worktree (the main checkout can't be removed)".into()));
+        };
+        let (r, w) = (&self.repos[ri], &self.repos[ri].worktrees[wi]);
+        let label = format!("{}/{}", r.name, w.branch.as_deref().unwrap_or("detached"));
+        self.confirm = Some((r.name.clone(), w.path.clone(), label));
+    }
+
+    fn confirm_remove(&mut self) {
+        let Some((repo, path, _)) = self.confirm.take() else { return };
+        let Some(ri) = self.repos.iter().position(|r| r.name == repo) else { return };
+        let Some(wt) = self.repos[ri].worktrees.iter().find(|w| w.path == path).cloned() else { return };
+        let r = lifecycle::remove_worktree(&self.repos[ri], &wt).map_err(|e| e.to_string());
+        if r.is_ok() {
+            // Don't wait for the next rescan to drop the row.
+            self.repos[ri].worktrees.retain(|w| w.path != path);
+        }
+        self.say(r);
+        self.refresh();
+    }
+
     fn start_chat(&mut self) {
         let cwd = self.selected_repo().map(|i| self.repos[i].path.clone()).unwrap_or_else(config::root);
         self.input = Some((InputKind::Chat(cwd), String::new()));
@@ -483,6 +540,14 @@ impl App {
             self.on_picker_key(k);
             return;
         }
+        if self.confirm.is_some() {
+            if k.code == KeyCode::Char('y') {
+                self.confirm_remove();
+            } else {
+                self.confirm = None;
+            }
+            return;
+        }
         if let Some((_, buf)) = self.input.as_mut() {
             match k.code {
                 KeyCode::Enter => self.submit_input(),
@@ -526,6 +591,7 @@ impl App {
             KeyCode::Char('P') => self.picker = Some(Picker { query: String::new(), sel: 0 }),
             KeyCode::Char('w') => self.start_worktree(),
             KeyCode::Char('c') => self.start_chat(),
+            KeyCode::Char('x') => self.start_remove(),
             KeyCode::Char('h') | KeyCode::Left if self.grid => self.move_agent(-1),
             KeyCode::Char('l') | KeyCode::Right if self.grid => self.move_agent(1),
             KeyCode::Char('j') | KeyCode::Down if self.grid => self.move_agent(self.grid_cols as isize),
@@ -600,15 +666,7 @@ impl App {
                 }
                 Kind::Agent { entry, show_label } => {
                     let e = &self.entries[*entry];
-                    let label = if *show_label {
-                        if e.p.is_chat() {
-                            e.p.window_name.clone()
-                        } else {
-                            e.a.branch.clone().unwrap_or_else(|| e.p.window_name.clone())
-                        }
-                    } else {
-                        String::new()
-                    };
+                    let label = if *show_label { fit(&model::label(e), 21) } else { String::new() };
                     let task = e.a.task.clone().unwrap_or_default();
                     let what = match e.a.status {
                         Status::NeedsInput => e.a.message.clone().unwrap_or(task),
@@ -649,7 +707,10 @@ impl App {
             let title = match self.selected_entry() {
                 Some(e) => Line::from(vec![
                     Span::styled(format!(" {} ", e.a.status.glyph()), status_style(e.a.status)),
-                    Span::styled(format!("{}:{} ", e.p.session, e.p.window_name), Style::new().fg(TEXT)),
+                    Span::styled(
+                        if e.p.is_chat() { format!("{} ", model::chat_title(e)) } else { format!("{}:{} ", e.p.session, e.p.window_name) },
+                        Style::new().fg(TEXT),
+                    ),
                     Span::styled(format!("{} ", e.a.pane_id), Style::new().fg(FAINT)),
                 ]),
                 None => Line::styled(" peek ", dim()),
@@ -682,11 +743,18 @@ impl App {
                 Span::styled("▏", Style::new().fg(ACCENT)),
             ]
         };
-        let foot_line = if let Some((kind, buf)) = &self.input {
+        let foot_line = if let Some((_, _, label)) = &self.confirm {
+            Line::from(vec![
+                Span::styled(" remove worktree ", Style::new().fg(Color::Black).bg(RED).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {label} and close its session? "), Style::new().fg(TEXT)),
+                Span::styled("y", Style::new().fg(RED).add_modifier(Modifier::BOLD)),
+                Span::styled("/any other key cancels", dim()),
+            ])
+        } else if let Some((kind, buf)) = &self.input {
             let label = match kind {
                 InputKind::Reply => format!(
                     "reply to {}",
-                    self.selected_entry().map(|e| e.p.window_name.clone()).unwrap_or_default()
+                    self.selected_entry().map(model::label).unwrap_or_default()
                 ),
                 InputKind::Worktree(i) => format!("new branch in {}", self.repos[*i].name),
                 InputKind::Chat(_) => "new chat topic".to_string(),
@@ -709,7 +777,7 @@ impl App {
             Line::from(spans)
         } else {
             let keys = [
-                ("⏎", "jump"), ("a", "allow"), ("d", "deny"), ("r", "reply"), ("w", "worktree"), ("c", "chat"),
+                ("⏎", "jump"), ("a", "allow"), ("d", "deny"), ("r", "reply"), ("w", "worktree"), ("x", "remove"), ("c", "chat"),
                 ("P", "pin"), ("m", "grid"), ("/", "filter"), ("tab", "fold"), ("p", "peek"), ("n", "next"), ("q", "quit"),
             ];
             let mut spans = vec![];
@@ -746,7 +814,7 @@ impl App {
             let e = &self.entries[ei];
             let selected = Some(ri) == self.list.selected();
             let name = if e.p.is_chat() {
-                e.p.window_name.clone()
+                model::chat_title(e)
             } else {
                 format!("{}/{}", e.a.repo.as_deref().unwrap_or("?"), e.a.branch.as_deref().unwrap_or(&e.p.window_name))
             };
