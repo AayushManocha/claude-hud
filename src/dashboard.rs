@@ -5,10 +5,10 @@ use crate::state::{self, Status};
 use crate::{config, lifecycle, sync, tmux};
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -49,12 +49,35 @@ struct App {
     quit: bool,
 }
 
-fn status_style(s: Status) -> Style {
+const TEXT: Color = Color::Rgb(235, 219, 178);
+const DIM: Color = Color::Rgb(146, 131, 116);
+const FAINT: Color = Color::Rgb(80, 73, 69);
+const SURFACE: Color = Color::Rgb(60, 56, 54);
+const ACCENT: Color = Color::Rgb(131, 165, 152);
+const RED: Color = Color::Rgb(251, 73, 52);
+const YELLOW: Color = Color::Rgb(250, 189, 47);
+const GREEN: Color = Color::Rgb(184, 187, 38);
+
+fn status_color(s: Status) -> Color {
     match s {
-        Status::NeedsInput => Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-        Status::Working => Style::new().fg(Color::Yellow),
-        Status::Idle => Style::new().fg(Color::Green),
+        Status::NeedsInput => RED,
+        Status::Working => YELLOW,
+        Status::Idle => GREEN,
     }
+}
+
+fn status_style(s: Status) -> Style {
+    let st = Style::new().fg(status_color(s));
+    if s == Status::NeedsInput { st.add_modifier(Modifier::BOLD) } else { st }
+}
+
+fn dim() -> Style {
+    Style::new().fg(DIM)
+}
+
+/// Rounded panel with a muted border.
+fn panel<'a>() -> Block<'a> {
+    Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(FAINT))
 }
 
 fn age(secs: u64) -> String {
@@ -394,18 +417,21 @@ impl App {
     fn render(&mut self, f: &mut Frame) {
         let [head, main, foot] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)]).areas(f.area());
-        let peek_w = if self.peek && !self.grid { main.width / 2 } else { 0 };
+        let peek_w = if self.peek && !self.grid { main.width * 11 / 20 } else { 0 };
         let [body, peek] = Layout::horizontal([Constraint::Min(20), Constraint::Length(peek_w)]).areas(main);
 
         let count = |s| self.entries.iter().filter(|e| e.a.status == s).count();
-        let mut title = vec![Span::styled(" cc-hud ", Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED))];
+        let mut title = vec![Span::styled(" ◆ cc-hud ", Style::new().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD))];
         for (s, word) in [(Status::NeedsInput, "need you"), (Status::Working, "working"), (Status::Idle, "idle")] {
-            title.push(Span::styled(format!("  {} {} {}", s.glyph(), count(s), word), status_style(s)));
+            let n = count(s);
+            let st = if n == 0 { Style::new().fg(FAINT) } else { status_style(s) };
+            title.push(Span::styled(format!("  {} {n}", s.glyph()), st));
+            title.push(Span::styled(format!(" {word}"), if n == 0 { Style::new().fg(FAINT) } else { dim() }));
         }
         f.render_widget(Line::from(title), head);
 
         if self.grid {
-            self.render_grid(f, body);
+            self.render_grid(f, main);
             self.render_footer(f, foot);
             return;
         }
@@ -415,26 +441,26 @@ impl App {
             .iter()
             .map(|r| match &r.kind {
                 Kind::Group { label, collapsed, counts } => {
-                    let mut spans = vec![Span::styled(
-                        format!("{} {label}", if *collapsed { "▸" } else { "▾" }),
-                        Style::new().add_modifier(Modifier::BOLD),
-                    )];
+                    let mut spans = vec![
+                        Span::styled(if *collapsed { "▸ " } else { "▾ " }, Style::new().fg(ACCENT)),
+                        Span::styled(label.clone(), Style::new().fg(TEXT).add_modifier(Modifier::BOLD)),
+                    ];
                     for (n, s) in counts.iter().zip([Status::NeedsInput, Status::Working, Status::Idle]) {
                         if *n > 0 {
-                            spans.push(Span::styled(format!("  {}{n}", s.glyph()), status_style(s)));
+                            spans.push(Span::styled(format!("  {} {n}", s.glyph()), status_style(s)));
                         }
                     }
                     if counts.iter().all(|n| *n == 0) {
-                        spans.push(Span::styled("  no agents", Style::new().fg(Color::DarkGray)));
+                        spans.push(Span::styled("  no agents", Style::new().fg(FAINT)));
                     }
                     ListItem::new(Line::from(spans))
                 }
                 Kind::Worktree { repo, wt } => {
                     let w = &self.repos[*repo].worktrees[*wt];
                     ListItem::new(Line::from(vec![
-                        Span::styled("   · ", Style::new().fg(Color::DarkGray)),
-                        Span::raw(format!("{:<24}", w.branch.as_deref().unwrap_or("(detached)"))),
-                        Span::styled("no agent — enter opens a shell", Style::new().fg(Color::DarkGray)),
+                        Span::styled("  ╰ ", Style::new().fg(FAINT)),
+                        Span::styled(format!("{:<22}", w.branch.as_deref().unwrap_or("(detached)")), Style::new().fg(TEXT)),
+                        Span::styled("no agent · ⏎ opens a shell", Style::new().fg(FAINT)),
                     ]))
                 }
                 Kind::Agent { entry, show_label } => {
@@ -459,83 +485,106 @@ impl App {
                     };
                     let st = status_style(e.a.status);
                     ListItem::new(Line::from(vec![
-                        Span::styled(format!("   {} ", e.a.status.glyph()), st),
-                        Span::raw(format!("{label:<24}")),
+                        Span::styled(format!("  {} ", e.a.status.glyph()), st),
+                        Span::styled(format!("{label:<22}"), Style::new().fg(TEXT)),
                         Span::styled(format!("{:<12}", e.a.status.label()), st),
-                        Span::styled(format!("{:>5}  ", age(now.saturating_sub(e.a.since))), Style::new().fg(Color::DarkGray)),
-                        Span::raw(what),
+                        Span::styled(format!("{:>4}  ", age(now.saturating_sub(e.a.since))), Style::new().fg(FAINT)),
+                        Span::styled(what, dim()),
                     ]))
                 }
             })
             .collect();
+        let list_block = panel().title(Span::styled(" agents ", Style::new().fg(DIM)));
         if items.is_empty() {
-            f.render_widget(
-                Paragraph::new("  no agents running (or none match the filter)").style(Style::new().fg(Color::DarkGray)),
-                body,
-            );
+            let msg = "no agents running (or none match the filter)";
+            f.render_widget(Paragraph::new(format!("\n  {msg}")).style(Style::new().fg(FAINT)).block(list_block), body);
         } else {
+            let inner = list_block.inner(body);
+            f.render_widget(list_block, body);
             f.render_stateful_widget(
-                List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED)),
-                body,
+                List::new(items)
+                    .highlight_symbol("▍")
+                    .highlight_style(Style::new().bg(SURFACE).fg(ACCENT).add_modifier(Modifier::BOLD)),
+                inner,
                 &mut self.list,
             );
         }
 
         if self.peek && !self.grid {
-            let title = self
-                .selected_entry()
-                .map(|e| format!(" {} · {}:{} ", e.a.pane_id, e.p.session, e.p.window_name))
-                .unwrap_or_else(|| " peek (select an agent) ".into());
+            let title = match self.selected_entry() {
+                Some(e) => Line::from(vec![
+                    Span::styled(format!(" {} ", e.a.status.glyph()), status_style(e.a.status)),
+                    Span::styled(format!("{}:{} ", e.p.session, e.p.window_name), Style::new().fg(TEXT)),
+                    Span::styled(format!("{} ", e.a.pane_id), Style::new().fg(FAINT)),
+                ]),
+                None => Line::styled(" peek ", dim()),
+            };
+            let block = panel().title(title);
+            let inner = block.inner(peek);
             let lines: Vec<&str> = self.peek_text.trim_end().lines().collect();
-            let h = peek.height as usize;
-            let tail = lines[lines.len().saturating_sub(h)..].join("\n");
-            f.render_widget(Paragraph::new(tail).block(Block::new().borders(Borders::LEFT).title(title)), peek);
+            let tail = lines[lines.len().saturating_sub(inner.height as usize)..].join("\n");
+            let body_text = if lines.is_empty() {
+                Paragraph::new("\n  select an agent to peek at its pane").style(Style::new().fg(FAINT))
+            } else {
+                Paragraph::new(tail).style(Style::new().fg(TEXT))
+            };
+            f.render_widget(body_text.block(block), peek);
         }
 
         self.render_footer(f, foot);
     }
-    fn render_footer(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+
+    fn render_footer(&self, f: &mut Frame, area: Rect) {
         let fresh = self.msg.as_ref().filter(|(_, t)| t.elapsed() < Duration::from_secs(4));
+        let prompt = |label: String, buf: &str| -> Vec<Span<'static>> {
+            vec![
+                Span::styled(format!(" {label} "), Style::new().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {buf}"), Style::new().fg(TEXT)),
+                Span::styled("▏", Style::new().fg(ACCENT)),
+            ]
+        };
         let foot_line = if let Some((kind, buf)) = &self.input {
             let label = match kind {
                 InputKind::Reply => format!(
                     "reply to {}",
                     self.selected_entry().map(|e| e.p.window_name.clone()).unwrap_or_default()
                 ),
-                InputKind::Worktree(i) => format!("new worktree branch in {}", self.repos[*i].name),
+                InputKind::Worktree(i) => format!("new branch in {}", self.repos[*i].name),
                 InputKind::Chat(_) => "new chat topic".to_string(),
             };
-            let mut spans = vec![
-                Span::styled(format!(" {label}: "), Style::new().fg(Color::Cyan)),
-                Span::raw(buf.clone()),
-                Span::styled("█", Style::new().fg(Color::Cyan)),
-            ];
+            let mut spans = prompt(label, buf);
             if let Some((Err(e), _)) = fresh {
-                spans.push(Span::styled(format!("   ✗ {e}"), Style::new().fg(Color::Red)));
+                spans.push(Span::styled(format!("   ✗ {e}"), Style::new().fg(RED)));
             }
             Line::from(spans)
         } else if let Some((r, _)) = fresh {
             match r {
-                Ok(m) => Line::styled(format!(" ✓ {m}"), Style::new().fg(Color::Green)),
-                Err(m) => Line::styled(format!(" ✗ {m}"), Style::new().fg(Color::Red)),
+                Ok(m) => Line::styled(format!(" ✓ {m}"), Style::new().fg(GREEN)),
+                Err(m) => Line::styled(format!(" ✗ {m}"), Style::new().fg(RED)),
             }
         } else if self.typing || !self.filter.is_empty() {
-            Line::from(vec![
-                Span::styled(" /", Style::new().fg(Color::Cyan)),
-                Span::raw(self.filter.clone()),
-                Span::styled(if self.typing { "█" } else { "" }, Style::new().fg(Color::Cyan)),
-            ])
+            let mut spans = prompt("filter".into(), &self.filter);
+            if !self.typing {
+                spans.pop();
+            }
+            Line::from(spans)
         } else {
-            Line::styled(
-                " [enter] jump/open  [a]llow  [d]eny  [r]eply  [w]orktree  [c]hat  [m] grid  [/] filter  [tab] fold  [p] peek  [n] next  [q] quit",
-                Style::new().fg(Color::DarkGray),
-            )
+            let keys = [
+                ("⏎", "jump"), ("a", "allow"), ("d", "deny"), ("r", "reply"), ("w", "worktree"), ("c", "chat"),
+                ("m", "grid"), ("/", "filter"), ("tab", "fold"), ("p", "peek"), ("n", "next"), ("q", "quit"),
+            ];
+            let mut spans = vec![];
+            for (k, d) in keys {
+                spans.push(Span::styled(format!(" {k} "), Style::new().fg(TEXT).bg(SURFACE).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(format!(" {d}  "), dim()));
+            }
+            Line::from(spans)
         };
         f.render_widget(foot_line, area);
     }
 
     /// Mission control: a live tile per agent. Read-only; enter jumps in.
-    fn render_grid(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
+    fn render_grid(&mut self, f: &mut Frame, area: Rect) {
         let agents: Vec<(usize, usize)> = self
             .rows
             .iter()
@@ -546,7 +595,7 @@ impl App {
             })
             .collect();
         if agents.is_empty() {
-            f.render_widget(Paragraph::new("  no agents running (or none match the filter)").style(Style::new().fg(Color::DarkGray)), area);
+            f.render_widget(Paragraph::new("\n  no agents running (or none match the filter)").style(Style::new().fg(FAINT)), area);
             return;
         }
         let cols = (agents.len() as f64).sqrt().ceil() as usize;
@@ -562,20 +611,23 @@ impl App {
             } else {
                 format!("{}/{}", e.a.repo.as_deref().unwrap_or("?"), e.a.branch.as_deref().unwrap_or(&e.p.window_name))
             };
-            let mut border = status_style(e.a.status);
-            if selected {
-                border = border.add_modifier(Modifier::REVERSED);
-            }
+            let color = status_color(e.a.status);
+            let title = if selected {
+                Span::styled(format!(" {} {name} ", e.a.status.glyph()), Style::new().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled(format!(" {} {name} ", e.a.status.glyph()), Style::new().fg(color))
+            };
             let text = self.tiles.get(&e.a.pane_id).map(String::as_str).unwrap_or("");
             let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
             let h = cell.height.saturating_sub(2) as usize;
             let tail = lines[lines.len().saturating_sub(h)..].join("\n");
+            let border = if selected { Style::new().fg(color) } else { Style::new().fg(FAINT) };
             f.render_widget(
-                Paragraph::new(tail).block(
-                    Block::new()
-                        .borders(Borders::ALL)
-                        .border_style(status_style(e.a.status))
-                        .title(Span::styled(format!(" {} {name} ", e.a.status.glyph()), border)),
+                Paragraph::new(tail).style(Style::new().fg(TEXT)).block(
+                    Block::bordered()
+                        .border_type(if selected { BorderType::Thick } else { BorderType::Rounded })
+                        .border_style(border)
+                        .title(title),
                 ),
                 cell,
             );
