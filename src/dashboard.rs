@@ -25,8 +25,9 @@ enum InputKind {
 
 /// A destructive action waiting on a y/n answer.
 enum Confirm {
-    /// Remove a linked worktree: (repo name, path, label).
-    Worktree(String, PathBuf, String),
+    /// Remove a linked worktree: (repo name, path, label, force). `force` is asked for
+    /// only after git refused because of uncommitted changes.
+    Worktree(String, PathBuf, String, bool),
     /// Kill a chat's tmux session: (session name, label).
     Chat(String, String),
 }
@@ -430,12 +431,12 @@ impl App {
         };
         let (r, w) = (&self.repos[ri], &self.repos[ri].worktrees[wi]);
         let label = format!("{}/{}", r.name, w.branch.as_deref().unwrap_or("detached"));
-        self.confirm = Some(Confirm::Worktree(r.name.clone(), w.path.clone(), label));
+        self.confirm = Some(Confirm::Worktree(r.name.clone(), w.path.clone(), label, false));
     }
 
     fn confirm_remove(&mut self) {
-        let (repo, path) = match self.confirm.take() {
-            Some(Confirm::Worktree(repo, path, _)) => (repo, path),
+        let (repo, path, force) = match self.confirm.take() {
+            Some(Confirm::Worktree(repo, path, _, force)) => (repo, path, force),
             Some(Confirm::Chat(session, _)) => {
                 let r = lifecycle::kill_chat(&session).map_err(|e| e.to_string());
                 self.say(r);
@@ -445,7 +446,15 @@ impl App {
         };
         let Some(ri) = self.repos.iter().position(|r| r.name == repo) else { return };
         let Some(wt) = self.repos[ri].worktrees.iter().find(|w| w.path == path).cloned() else { return };
-        let r = lifecycle::remove_worktree(&self.repos[ri], &wt).map_err(|e| e.to_string());
+        let r = lifecycle::remove_worktree(&self.repos[ri], &wt, force).map_err(|e| e.to_string());
+        if let Err(e) = &r {
+            // Git names --force only for modified/untracked files; offer it instead of a dead end.
+            if !force && e.contains("--force") {
+                let label = format!("{}/{}", repo, wt.branch.as_deref().unwrap_or("detached"));
+                self.confirm = Some(Confirm::Worktree(repo, path, label, true));
+                return;
+            }
+        }
         if r.is_ok() {
             // Don't wait for the next rescan to drop the row.
             self.repos[ri].worktrees.retain(|w| w.path != path);
@@ -764,7 +773,10 @@ impl App {
         };
         let foot_line = if let Some(c) = &self.confirm {
             let (title, what) = match c {
-                Confirm::Worktree(_, _, l) => (" remove worktree ", format!("{l} and close its session")),
+                Confirm::Worktree(_, _, l, false) => (" remove worktree ", format!("{l} and close its session")),
+                Confirm::Worktree(_, _, l, true) => {
+                    (" force remove ", format!("{l} has uncommitted or untracked files; discard them and close its session"))
+                }
                 Confirm::Chat(_, l) => (" kill chat ", format!("{l} and its session")),
             };
             Line::from(vec![

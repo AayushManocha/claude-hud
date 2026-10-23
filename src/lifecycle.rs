@@ -156,11 +156,18 @@ pub fn new_worktree(client: Option<&str>, repo: &Repo, branch: &str, launch: boo
 
 /// Remove a linked worktree's checkout and close its tmux session. The branch is kept.
 /// Git goes first: it refuses a dirty or locked worktree, and then nothing is closed.
-pub fn remove_worktree(repo: &Repo, wt: &Worktree) -> Result<String> {
+/// With `force`, uncommitted and untracked files in it are discarded.
+pub fn remove_worktree(repo: &Repo, wt: &Worktree, force: bool) -> Result<String> {
     if wt.path == repo.path {
         bail!("refusing to remove the main checkout of {}", repo.name);
     }
-    git(&repo.path, &["worktree", "remove", &wt.path.display().to_string()])?;
+    let path = wt.path.display().to_string();
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(&path);
+    git(&repo.path, &args)?;
     if let Some(sess) = find_session(&wt.path) {
         crate::tmux::run(&["kill-session", "-t", &sess]);
     }
@@ -213,14 +220,13 @@ mod tests {
 
         // Dirty worktrees are refused and left intact.
         std::fs::write(dir.join("junk"), "x").unwrap();
-        assert!(remove_worktree(&repo, &wt).is_err());
+        let err = remove_worktree(&repo, &wt, false).unwrap_err().to_string();
+        assert!(err.contains("--force"), "{err}");
         assert!(dir.exists());
-        std::fs::remove_file(dir.join("junk")).unwrap();
-
-        remove_worktree(&repo, &wt).unwrap();
+        remove_worktree(&repo, &wt, true).unwrap();
         assert!(!dir.exists());
         let main_wt = Worktree { path: main.clone(), branch: None, last_used: 0 };
-        assert!(remove_worktree(&repo, &main_wt).is_err());
+        assert!(remove_worktree(&repo, &main_wt, true).is_err());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
