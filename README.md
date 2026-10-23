@@ -29,7 +29,7 @@ Restart running Claude sessions so they pick up the hooks.
 | `M` | dashboard in tiled mission-control view |
 | `N` | jump to the agent that has waited longest for you |
 
-Dashboard: `enter`/`space` jump/open, `a` allow once, `d` deny, `r` reply, `w` new worktree, `x` remove worktree (confirms; keeps the branch),
+Dashboard: `enter`/`space` jump/open, `a` allow once, `d` deny, `r` reply, `w` new worktree, `x` remove worktree / kill chat (confirms; keeps the branch),
 `c` new chat, `P` pin repos (fuzzy picker), `m` list/grid, `/` filter, `tab` fold, `p` peek, `n` next waiting, `q` quit.
 
 ## CLI

@@ -167,6 +167,14 @@ pub fn remove_worktree(repo: &Repo, wt: &Worktree) -> Result<String> {
     Ok(format!("removed {}", wt.path.display()))
 }
 
+/// Kill a chat's tmux session (and the agent in it).
+pub fn kill_chat(session: &str) -> Result<String> {
+    if !crate::tmux::run(&["kill-session", "-t", &format!("={session}")]) {
+        bail!("couldn't kill session {session}");
+    }
+    Ok(format!("killed {session}"))
+}
+
 pub fn new_chat(client: Option<&str>, topic: &str, cwd: &Path) -> Result<String> {
     let topic = topic.trim();
     if topic.is_empty() {

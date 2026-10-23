@@ -23,6 +23,14 @@ enum InputKind {
     Chat(PathBuf),
 }
 
+/// A destructive action waiting on a y/n answer.
+enum Confirm {
+    /// Remove a linked worktree: (repo name, path, label).
+    Worktree(String, PathBuf, String),
+    /// Kill a chat's tmux session: (session name, label).
+    Chat(String, String),
+}
+
 /// Fuzzy repo picker for pinning (`P`).
 struct Picker {
     query: String,
@@ -55,8 +63,7 @@ struct App {
     /// When `seen` last changed; decisions right after a change are refused.
     seen_at: Instant,
     input: Option<(InputKind, String)>,
-    /// Worktree awaiting a y/n answer before removal: (repo name, path, prompt label).
-    confirm: Option<(String, PathBuf, String)>,
+    confirm: Option<Confirm>,
     msg: Option<(Result<String, String>, Instant)>,
     list: ListState,
     sel: Option<Key>,
@@ -414,16 +421,28 @@ impl App {
     }
 
     fn start_remove(&mut self) {
+        if let Some(e) = self.selected_entry().filter(|e| e.p.is_chat()) {
+            self.confirm = Some(Confirm::Chat(e.p.session.clone(), model::label(e)));
+            return;
+        }
         let Some((ri, wi)) = self.selected_worktree() else {
-            return self.say(Err("select a linked worktree (the main checkout can't be removed)".into()));
+            return self.say(Err("select a chat or linked worktree (the main checkout can't be removed)".into()));
         };
         let (r, w) = (&self.repos[ri], &self.repos[ri].worktrees[wi]);
         let label = format!("{}/{}", r.name, w.branch.as_deref().unwrap_or("detached"));
-        self.confirm = Some((r.name.clone(), w.path.clone(), label));
+        self.confirm = Some(Confirm::Worktree(r.name.clone(), w.path.clone(), label));
     }
 
     fn confirm_remove(&mut self) {
-        let Some((repo, path, _)) = self.confirm.take() else { return };
+        let (repo, path) = match self.confirm.take() {
+            Some(Confirm::Worktree(repo, path, _)) => (repo, path),
+            Some(Confirm::Chat(session, _)) => {
+                let r = lifecycle::kill_chat(&session).map_err(|e| e.to_string());
+                self.say(r);
+                return self.refresh();
+            }
+            None => return,
+        };
         let Some(ri) = self.repos.iter().position(|r| r.name == repo) else { return };
         let Some(wt) = self.repos[ri].worktrees.iter().find(|w| w.path == path).cloned() else { return };
         let r = lifecycle::remove_worktree(&self.repos[ri], &wt).map_err(|e| e.to_string());
@@ -743,10 +762,14 @@ impl App {
                 Span::styled("▏", Style::new().fg(ACCENT)),
             ]
         };
-        let foot_line = if let Some((_, _, label)) = &self.confirm {
+        let foot_line = if let Some(c) = &self.confirm {
+            let (title, what) = match c {
+                Confirm::Worktree(_, _, l) => (" remove worktree ", format!("{l} and close its session")),
+                Confirm::Chat(_, l) => (" kill chat ", format!("{l} and its session")),
+            };
             Line::from(vec![
-                Span::styled(" remove worktree ", Style::new().fg(Color::Black).bg(RED).add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" {label} and close its session? "), Style::new().fg(TEXT)),
+                Span::styled(title, Style::new().fg(Color::Black).bg(RED).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {what}? "), Style::new().fg(TEXT)),
                 Span::styled("y", Style::new().fg(RED).add_modifier(Modifier::BOLD)),
                 Span::styled("/any other key cancels", dim()),
             ])
@@ -777,7 +800,7 @@ impl App {
             Line::from(spans)
         } else {
             let keys = [
-                ("⏎", "jump"), ("a", "allow"), ("d", "deny"), ("r", "reply"), ("w", "worktree"), ("x", "remove"), ("c", "chat"),
+                ("⏎", "jump"), ("a", "allow"), ("d", "deny"), ("r", "reply"), ("w", "worktree"), ("x", "kill/remove"), ("c", "chat"),
                 ("P", "pin"), ("m", "grid"), ("/", "filter"), ("tab", "fold"), ("p", "peek"), ("n", "next"), ("q", "quit"),
             ];
             let mut spans = vec![];
