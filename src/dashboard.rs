@@ -316,6 +316,17 @@ impl App {
         }
     }
 
+    /// One step up/down the list, wrapping past either end.
+    fn step(&mut self, d: isize) {
+        let n = self.rows.len() as isize;
+        if n == 0 {
+            return;
+        }
+        let cur = self.list.selected().unwrap_or(0) as isize;
+        self.select(Some((cur + d).rem_euclid(n) as usize));
+        self.refresh_peek();
+    }
+
     fn move_by(&mut self, d: isize) {
         if self.rows.is_empty() {
             return;
@@ -543,8 +554,20 @@ impl App {
             return;
         }
         let cur = agents.iter().position(|&i| Some(i) == self.list.selected()).unwrap_or(0) as isize;
-        let next = (cur + d).clamp(0, agents.len() as isize - 1) as usize;
-        self.select(Some(agents[next]));
+        let n = agents.len() as isize;
+        let cols = self.grid_cols as isize;
+        let t = cur + d;
+        let next = if (0..n).contains(&t) {
+            t
+        } else if d.abs() == cols && cols > 1 {
+            // Vertical wrap keeps the column: down off the bottom lands in the top row,
+            // up off the top lands in the last row that has this column.
+            let col = cur % cols;
+            if d > 0 { col } else { (0..n).rev().find(|i| i % cols == col).unwrap_or(cur) }
+        } else {
+            t.rem_euclid(n)
+        };
+        self.select(Some(agents[next as usize]));
     }
 
     /// Longest-waiting agent that needs input.
@@ -628,8 +651,8 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right if self.grid => self.move_agent(1),
             KeyCode::Char('j') | KeyCode::Down if self.grid => self.move_agent(self.grid_cols as isize),
             KeyCode::Char('k') | KeyCode::Up if self.grid => self.move_agent(-(self.grid_cols as isize)),
-            KeyCode::Char('j') | KeyCode::Down => self.move_by(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_by(-1),
+            KeyCode::Char('j') | KeyCode::Down => self.step(1),
+            KeyCode::Char('k') | KeyCode::Up => self.step(-1),
             KeyCode::Char('g') | KeyCode::Home => self.move_by(isize::MIN / 2),
             KeyCode::Char('G') | KeyCode::End => self.move_by(isize::MAX / 2),
             KeyCode::Tab => self.toggle_fold(),
