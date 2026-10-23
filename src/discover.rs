@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -6,6 +7,8 @@ use std::process::Command;
 pub struct Worktree {
     pub path: PathBuf,
     pub branch: Option<String>,
+    /// Unix seconds of the last sign of use (git activity or tmux session activity); 0 if unknown.
+    pub last_used: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -38,6 +41,40 @@ fn subdirs(p: &Path) -> Vec<PathBuf> {
     v
 }
 
+fn mtime(p: &Path) -> u64 {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Newest touch of the checkout's private git files: the index (status, add, checkout),
+/// HEAD and its reflog (commits, branch switches).
+fn git_activity(wt: &Path) -> u64 {
+    let dot_git = wt.join(".git");
+    let gitdir = match std::fs::read_to_string(&dot_git) {
+        Ok(s) => s.strip_prefix("gitdir:").map(|g| PathBuf::from(g.trim())).unwrap_or(dot_git),
+        Err(_) => dot_git, // main checkout: .git is a directory
+    };
+    ["index", "HEAD", "logs/HEAD"].iter().map(|f| mtime(&gitdir.join(f))).max().unwrap_or(0)
+}
+
+/// Last activity of tmux sessions tagged with a worktree path (`@hud_path`).
+fn session_activity() -> HashMap<PathBuf, u64> {
+    let out = Command::new("tmux")
+        .args(["list-sessions", "-F", "#{@hud_path}\t#{session_activity}"])
+        .output();
+    let Some(out) = out.ok().filter(|o| o.status.success()) else { return HashMap::new() };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let (p, t) = l.split_once('\t')?;
+            Some((PathBuf::from(p), t.parse().ok()?))
+        })
+        .collect()
+}
+
 pub fn parse_worktrees(porcelain: &str) -> Vec<Worktree> {
     let mut out = vec![];
     for block in porcelain.split("\n\n") {
@@ -55,7 +92,8 @@ pub fn parse_worktrees(porcelain: &str) -> Vec<Worktree> {
         }
         if let (Some(path), false) = (path, skip) {
             if path.exists() {
-                out.push(Worktree { path: std::fs::canonicalize(&path).unwrap_or(path), branch });
+                let last_used = git_activity(&path);
+                out.push(Worktree { path: std::fs::canonicalize(&path).unwrap_or(path), branch, last_used });
             }
         }
     }
@@ -81,6 +119,12 @@ pub fn scan(root: &Path) -> Vec<Repo> {
                     found.extend(load_repo(d2));
                 }
             }
+        }
+    }
+    let sessions = session_activity();
+    for wt in found.iter_mut().flat_map(|r| r.worktrees.iter_mut()) {
+        if let Some(&t) = sessions.get(&wt.path) {
+            wt.last_used = wt.last_used.max(t);
         }
     }
     found

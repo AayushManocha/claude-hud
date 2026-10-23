@@ -151,7 +151,7 @@ pub fn build(entries: &[Entry], repos: &[Repo], pinned: &[String], toggled: &Has
         let mut idx = g.agents.clone();
         idx.sort_by_key(|&i| {
             let e = &entries[i];
-            (std::cmp::Reverse(urgency(e.a.status)), e.p.window_id.clone(), e.a.pane_id.clone())
+            (std::cmp::Reverse(urgency(e.a.status)), std::cmp::Reverse(e.a.updated), e.p.window_id.clone(), e.a.pane_id.clone())
         });
         // Keep a window's agents adjacent, ordered by its most urgent agent.
         let mut windows: Vec<&str> = vec![];
@@ -172,7 +172,11 @@ pub fn build(entries: &[Entry], repos: &[Repo], pinned: &[String], toggled: &Has
             }
         }
         if let Some(ri) = g.repo {
-            for (wi, wt) in repos[ri].worktrees.iter().enumerate() {
+            // Most recently used first; ties keep git's order.
+            let mut order: Vec<usize> = (0..repos[ri].worktrees.len()).collect();
+            order.sort_by_key(|&wi| std::cmp::Reverse(repos[ri].worktrees[wi].last_used));
+            for wi in order {
+                let wt = &repos[ri].worktrees[wi];
                 let listed = filter.is_empty()
                     || fuzzy(filter, &format!("{} {}", repos[ri].name, wt.branch.as_deref().unwrap_or("")));
                 if listed && !covered(&wt.path, &agent_dirs) {
@@ -273,7 +277,7 @@ mod tests {
             path: paths[0].0.into(),
             worktrees: paths
                 .iter()
-                .map(|(p, b)| crate::discover::Worktree { path: (*p).into(), branch: Some((*b).into()) })
+                .map(|(p, b)| crate::discover::Worktree { path: (*p).into(), branch: Some((*b).into()), last_used: 0 })
                 .collect(),
         }
     }
@@ -316,5 +320,14 @@ mod tests {
         let rows = build(&[e], &repos, &[], &HashSet::new(), "");
         assert_eq!(labels(&rows), ["G:r", "A:0", "W:0"]); // main has no agent, a is covered
     }
-}
 
+    #[test]
+    fn worktrees_most_recently_used_first() {
+        let mut repos = vec![repo("r", &[("/nope/r", "main"), ("/nope/r-wt/a", "a"), ("/nope/r-wt/b", "b")])];
+        for (w, t) in repos[0].worktrees.iter_mut().zip([5, 1, 9]) {
+            w.last_used = t;
+        }
+        let rows = build(&[], &repos, &["r".to_string()], &HashSet::from(["r".to_string()]), "");
+        assert_eq!(labels(&rows), ["G:r", "W:2", "W:0", "W:1"]);
+    }
+}

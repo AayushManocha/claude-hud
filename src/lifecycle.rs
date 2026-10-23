@@ -209,7 +209,7 @@ mod tests {
         let repo = Repo { name: "proj".into(), path: main.clone(), worktrees: vec![] };
         let dir = worktree_dir(&repo, "feat");
         sh(&main, &["worktree", "add", "-q", "-b", "feat", &dir.display().to_string()]);
-        let wt = Worktree { path: std::fs::canonicalize(&dir).unwrap(), branch: Some("feat".into()) };
+        let wt = Worktree { path: std::fs::canonicalize(&dir).unwrap(), branch: Some("feat".into()), last_used: 0 };
 
         // Dirty worktrees are refused and left intact.
         std::fs::write(dir.join("junk"), "x").unwrap();
@@ -219,7 +219,7 @@ mod tests {
 
         remove_worktree(&repo, &wt).unwrap();
         assert!(!dir.exists());
-        let main_wt = Worktree { path: main.clone(), branch: None };
+        let main_wt = Worktree { path: main.clone(), branch: None, last_used: 0 };
         assert!(remove_worktree(&repo, &main_wt).is_err());
         let _ = std::fs::remove_dir_all(&tmp);
     }
