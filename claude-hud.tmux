@@ -22,8 +22,10 @@ if [ -z "$BIN" ]; then
   else tmux display-message "claude-hud: cc-hud binary not found (cargo build --release)"; exit 0; fi
 fi
 
-tmux bind-key "$(opt @claude-hud-dashboard-key C)" display-popup -E -w 98% -h 95% -T " cc-hud " "'$BIN' dashboard --client '#{client_name}'"
-tmux bind-key "$(opt @claude-hud-grid-key M)" display-popup -E -w 100% -h 100% "'$BIN' dashboard --grid --client '#{client_name}'"
+# display-popup does not expand formats in its command, so go through run-shell
+# (which does) to hand the dashboard the real client name for switch-client.
+tmux bind-key "$(opt @claude-hud-dashboard-key C)" run-shell "tmux display-popup -c '#{client_name}' -E -w 98% -h 95% -T ' cc-hud ' \"'$BIN' dashboard --client '#{client_name}'\""
+tmux bind-key "$(opt @claude-hud-grid-key M)" run-shell "tmux display-popup -c '#{client_name}' -E -w 100% -h 100% \"'$BIN' dashboard --grid --client '#{client_name}'\""
 tmux bind-key "$(opt @claude-hud-next-key N)" run-shell "'$BIN' next --from '#{pane_id}'"
 
 # Idempotent: skip if already wired in (plugin reloads on `source-file`).

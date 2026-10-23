@@ -584,6 +584,8 @@ impl App {
 }
 
 pub fn run(client: Option<String>, grid: bool) -> Result<()> {
+    // An unexpanded `#{client_name}` means the launcher didn't substitute it.
+    let client = client.filter(|c| !c.contains("#{"));
     let mut term: DefaultTerminal = ratatui::init();
     let res = (|| -> Result<()> {
         let mut app = App::new(client, grid);
