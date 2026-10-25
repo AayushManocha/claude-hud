@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Para
 use ratatui::{DefaultTerminal, Frame};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 /// What the footer input line is collecting.
@@ -32,6 +32,15 @@ enum Confirm {
     Chat(String, String),
 }
 
+/// Outcome of a background worktree removal.
+struct Removal {
+    repo: String,
+    path: PathBuf,
+    label: String,
+    force: bool,
+    result: Result<String, String>,
+}
+
 /// Fuzzy repo picker for pinning (`P`).
 struct Picker {
     query: String,
@@ -44,6 +53,11 @@ struct App {
     rows: Vec<Row>,
     repos: Vec<Repo>,
     repo_rx: Receiver<Vec<Repo>>,
+    /// Worktrees being removed in the background, hidden from the list. The flag marks
+    /// finished ones, kept until a rescan no longer lists them (an older scan may still).
+    removing: HashMap<PathBuf, bool>,
+    removal_tx: Sender<Removal>,
+    removal_rx: Receiver<Removal>,
     toggled: HashSet<String>,
     grid: bool,
     grid_cols: usize,
@@ -131,12 +145,16 @@ impl App {
             }
             std::thread::sleep(Duration::from_secs(10));
         });
+        let (removal_tx, removal_rx) = mpsc::channel();
         let mut a = App {
             client,
             entries: vec![],
             rows: vec![],
             repos: vec![],
             repo_rx,
+            removing: HashMap::new(),
+            removal_tx,
+            removal_rx,
             toggled: HashSet::new(),
             grid,
             grid_cols: 1,
@@ -285,8 +303,16 @@ impl App {
                 .collect(),
             None => vec![],
         };
+        while let Ok(r) = self.removal_rx.try_recv() {
+            self.on_removed(r);
+        }
         while let Ok(r) = self.repo_rx.try_recv() {
             self.repos = r;
+            let listed: HashSet<&PathBuf> = self.repos.iter().flat_map(|r| &r.worktrees).map(|w| &w.path).collect();
+            self.removing.retain(|p, done| !*done || listed.contains(p));
+        }
+        for r in &mut self.repos {
+            r.worktrees.retain(|w| !self.removing.contains_key(&w.path));
         }
         if self.grid {
             self.tiles = self.entries.iter().map(|e| (e.a.pane_id.clone(), tmux::capture_ansi(&e.a.pane_id, 40))).collect();
@@ -461,21 +487,35 @@ impl App {
         };
         let Some(ri) = self.repos.iter().position(|r| r.name == repo) else { return };
         let Some(wt) = self.repos[ri].worktrees.iter().find(|w| w.path == path).cloned() else { return };
-        let r = lifecycle::remove_worktree(&self.repos[ri], &wt, force).map_err(|e| e.to_string());
-        if let Err(e) = &r {
-            // Git names --force only for modified/untracked files; offer it instead of a dead end.
-            if !force && e.contains("--force") {
-                let label = format!("{}/{}", repo, wt.branch.as_deref().unwrap_or("detached"));
-                self.confirm = Some(Confirm::Worktree(repo, path, label, true));
-                return;
+        let label = format!("{}/{}", repo, wt.branch.as_deref().unwrap_or("detached"));
+        // Hide the row now; git and the file deletion run off the UI thread.
+        self.removing.insert(path.clone(), false);
+        self.say(Ok(format!("removing {label}…")));
+        let (r, tx) = (self.repos[ri].clone(), self.removal_tx.clone());
+        std::thread::spawn(move || {
+            let result = lifecycle::remove_worktree(&r, &wt, force).map_err(|e| e.to_string());
+            let _ = tx.send(Removal { repo, path, label, force, result });
+        });
+        self.refresh();
+    }
+
+    fn on_removed(&mut self, r: Removal) {
+        match r.result {
+            Ok(m) => {
+                self.removing.insert(r.path, true);
+                self.say(Ok(m));
+            }
+            Err(e) => {
+                // The worktree is intact; it reappears on the next rescan.
+                self.removing.remove(&r.path);
+                // Git names --force only for modified/untracked files; offer it instead of a dead end.
+                if !r.force && e.contains("--force") {
+                    self.confirm = Some(Confirm::Worktree(r.repo, r.path, r.label, true));
+                } else {
+                    self.say(Err(format!("{}: {e}", r.label)));
+                }
             }
         }
-        if r.is_ok() {
-            // Don't wait for the next rescan to drop the row.
-            self.repos[ri].worktrees.retain(|w| w.path != path);
-        }
-        self.say(r);
-        self.refresh();
     }
 
     fn start_chat(&mut self) {
