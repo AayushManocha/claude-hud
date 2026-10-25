@@ -154,24 +154,52 @@ pub fn new_worktree(client: Option<&str>, repo: &Repo, branch: &str, launch: boo
     Ok(format!("worktree {} on {branch}", dir.display()))
 }
 
-/// Remove a linked worktree's checkout and close its tmux session. The branch is kept.
-/// Git goes first: it refuses a dirty or locked worktree, and then nothing is closed.
+/// Remove a linked worktree and close its tmux session. The branch is kept.
+/// Checks go first (git refuses dirty or locked worktrees; then nothing is closed or moved).
+/// The checkout is then renamed out of the way and git's record of it pruned, so the path
+/// is free at once; deleting the files (`target/`, `node_modules/`…) is left to a detached
+/// `rm -rf` that outlives the dashboard.
 /// With `force`, uncommitted and untracked files in it are discarded.
 pub fn remove_worktree(repo: &Repo, wt: &Worktree, force: bool) -> Result<String> {
     if wt.path == repo.path {
         bail!("refusing to remove the main checkout of {}", repo.name);
     }
-    let path = wt.path.display().to_string();
-    let mut args = vec!["worktree", "remove"];
-    if force {
-        args.push("--force");
+    let gitdir = git(&wt.path, &["rev-parse", "--absolute-git-dir"])?;
+    if Path::new(&gitdir).join("locked").exists() {
+        bail!("{} is locked; unlock it with git worktree unlock", wt.path.display());
     }
-    args.push(&path);
-    git(&repo.path, &args)?;
+    if !force && !git(&wt.path, &["status", "--porcelain"])?.is_empty() {
+        bail!("{} contains modified or untracked files, use --force to delete it", wt.path.display());
+    }
+    let name = wt.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let trash = wt.path.with_file_name(format!(".trash-{name}-{stamp}"));
     if let Some(sess) = find_session(&wt.path) {
         crate::tmux::run(&["kill-session", "-t", &sess]);
     }
+    std::fs::rename(&wt.path, &trash).with_context(|| format!("moving {} aside", wt.path.display()))?;
+    let pruned = git(&repo.path, &["worktree", "prune"]);
+    purge(&trash);
+    pruned?;
     Ok(format!("removed {}", wt.path.display()))
+}
+
+/// Delete `dir` in a detached process, so it finishes even if the dashboard closes first.
+fn purge(dir: &Path) {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let spawned = Command::new("nohup")
+        .arg("rm")
+        .arg("-rf")
+        .arg(dir)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if spawned.is_err() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// Kill a chat's tmux session (and the agent in it).
@@ -225,6 +253,16 @@ mod tests {
         assert!(dir.exists());
         remove_worktree(&repo, &wt, true).unwrap();
         assert!(!dir.exists());
+        let trash_left = |d: &Path| std::fs::read_dir(d).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with(".trash-"));
+        let parent = dir.parent().unwrap();
+        for _ in 0..100 {
+            if !trash_left(parent) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(!trash_left(parent));
+        assert!(!git(&main, &["worktree", "list"]).unwrap().contains("/feat"));
         let main_wt = Worktree { path: main.clone(), branch: None, last_used: 0 };
         assert!(remove_worktree(&repo, &main_wt, true).is_err());
         let _ = std::fs::remove_dir_all(&tmp);
