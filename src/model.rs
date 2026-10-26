@@ -203,7 +203,7 @@ mod tests {
                 task: Some("t".into()), tool: None, message: None, since: 0, updated: 0,
             },
             p: PaneInfo {
-                session: "dev".into(), window_id: win.into(), window_name: branch.into(),
+                session: "dev".into(), session_key: "dev".into(), window_id: win.into(), window_name: branch.into(),
                 kind: if chat { "chat".into() } else { "".into() },
                 topic: String::new(),
             },

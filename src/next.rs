@@ -1,19 +1,26 @@
-use crate::{sync, tmux};
+use crate::{mux, sync};
 use crate::state::Status;
 use anyhow::{Context, Result};
 
 /// Jump to the next agent that needs input, longest-waiting first,
 /// cycling onward from `from` (the invoking pane) when it is itself waiting.
+fn say(msg: &str) {
+    if !mux::flash(msg) {
+        println!("{msg}");
+    }
+}
+
 pub fn run(from: Option<String>) -> Result<()> {
-    let live = tmux::live_panes().context("tmux not reachable")?;
+    let from = from.or_else(mux::env_pane);
+    let live = mux::live_panes().context("no tmux or Rex server reachable")?;
     let mut waiting: Vec<_> = sync::live_agents(&live)
         .into_iter()
-        .filter(|a| a.status == Status::NeedsInput)
+        .filter(|a| a.status == Status::NeedsInput && live.contains_key(&a.pane_id))
         .collect();
     waiting.sort_by_key(|a| (a.since, a.pane_id.clone()));
 
     if waiting.is_empty() {
-        tmux::run(&["display-message", "cc-hud: no agents need input"]);
+        say("cc-hud: no agents need input");
         return Ok(());
     }
     let start = from
@@ -22,10 +29,9 @@ pub fn run(from: Option<String>) -> Result<()> {
         .map_or(0, |i| i + 1);
     let target = &waiting[start % waiting.len()];
     if Some(&target.pane_id) == from.as_ref() {
-        tmux::run(&["display-message", "cc-hud: this is the only agent needing input"]);
+        say("cc-hud: this is the only agent needing input");
         return Ok(());
     }
     let p = &live[&target.pane_id];
-    tmux::jump(None, p, &target.pane_id);
-    Ok(())
+    mux::jump(None, p, &target.pane_id).map_err(anyhow::Error::msg)
 }

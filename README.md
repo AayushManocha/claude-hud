@@ -1,6 +1,6 @@
 # claude-hud
 
-tmux HUD for running many Claude Code agents: worktrees, chats, status, approvals.
+HUD for running many Claude Code agents in tmux or [Rex](https://www.superlogical.com/rex/docs): worktrees, chats, status, approvals.
 
 ## Setup
 
@@ -22,6 +22,15 @@ Start a workspace with `cc-hud open` (attach-or-create session `dev` rooted at t
 Restart running Claude sessions so they pick up the hooks.
 
 `install` also routes Claude Code's status line through `cc-hud statusline`, which records your plan usage limits (5h / 7d, Pro and Max) for the dashboard header. Your existing status line command keeps running behind it unchanged. Limits update after each Claude response, and show "(Nm old)" when no session has reported for a while.
+
+## Rex
+
+cc-hud also drives Rex terminals through the `rex` CLI. Hooks, the dashboard (list, peek, allow/deny, reply, new worktree/chat, remove), `list`, `next` and `open` work the same; panes are shown as `rex:<id>`.
+
+- The dashboard can run as a tab that stays alive: `cc-hud dashboard --persistent`. `q`/`esc` (or the key again) switches back to the tab you came from, and it pauses its polling while hidden. Jumping to an agent (or creating a worktree or chat) closes it instead, so no dashboard tab is left behind in the session you left; the next `hud` creates a new one. A Rex action in `init.lua` creates the tab (labelled `cc-hud`, one per session) on first use and switches to and from it afterwards; the dashboard runs `rex do hud` (override the action name with `CC_HUD_REX_ACTION`) to switch back, then asks the app to show that tab, which needs Remote Control turned on in Rex's settings (a key press doesn't). Keys in `~/.config/rex/init.lua`: `cmd+shift+h` dashboard, `cmd+shift+n` jump to the agent that has waited longest. `m` in the dashboard toggles the tiled view. Without `--persistent` the dashboard exits on `q` as under tmux, e.g. `rex window new Dashboard -- cc-hud dashboard`.
+- The multiplexer for new sessions, settings and notifications is chosen as: `CC_HUD_MUX=tmux|rex`, else the one cc-hud runs inside (`$TMUX`, then `$REX_SESSION`), else tmux if a tmux server is up, else Rex. Existing panes are always reached through their own multiplexer, so both can be in use at once.
+- Rex has no options store, status bar or message line: set `CC_HUD_ROOT`, `CC_HUD_CLAUDE_CMD`, `CC_HUD_NOTIFY` and `CC_HUD_PROJECTS` as environment variables, expect no window glyphs or `cc-hud status` bar, and notifications fall back to macOS system notifications. Session tags are kept in `~/.local/state/cc-hud/tags`.
+- The dashboard doesn't start on the agent you came from (Rex doesn't report it).
 
 ## Keys (after the tmux prefix)
 

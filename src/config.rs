@@ -1,8 +1,12 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-/// A tmux global option (`set -g @claude-hud-…`), if the server is reachable and it's set.
+/// A tmux global option (`set -g @claude-hud-…`), if tmux is the active multiplexer,
+/// its server is reachable and the option is set. Under Rex, only the env vars apply.
 pub fn tmux_opt(name: &str) -> Option<String> {
+    if crate::mux::active() != crate::mux::Backend::Tmux {
+        return None;
+    }
     let out = Command::new("tmux").args(["show-option", "-gqv", name]).output().ok()?;
     let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !v.is_empty()).then_some(v)

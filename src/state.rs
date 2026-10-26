@@ -29,7 +29,7 @@ impl Status {
     }
 }
 
-/// One record per tmux pane running a Claude Code agent.
+/// One record per tmux or Rex pane running a Claude Code agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentState {
     pub pane_id: String,
@@ -68,8 +68,13 @@ pub fn state_dir() -> PathBuf {
 }
 
 fn path_for(pane_id: &str) -> PathBuf {
-    // "%12" -> "12.json"
-    state_dir().join(format!("{}.json", pane_id.trim_start_matches('%')))
+    // "%12" -> "12.json"; a Rex "session:…/block:…" keeps its characters that are safe in a file name.
+    let name: String = pane_id
+        .trim_start_matches('%')
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .collect();
+    state_dir().join(format!("{name}.json"))
 }
 
 pub fn load(pane_id: &str) -> Option<AgentState> {

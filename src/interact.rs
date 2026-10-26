@@ -1,9 +1,9 @@
-//! Answering an agent's prompt from outside its pane, via `tmux send-keys`.
+//! Answering an agent's prompt from outside its pane, via the multiplexer's send-keys.
 //! Everything here is conservative: we only type into a pane after parsing
 //! its current screen and confirming it shows what we expect.
 
 use crate::state::{self, Status};
-use crate::tmux;
+use crate::mux;
 
 pub const CAPTURE_LINES: usize = 60;
 pub const MAX_REPLY: usize = 500;
@@ -89,7 +89,7 @@ pub fn decide(pane_id: &str, d: Decision, seen: &str) -> Outcome {
     if st.status != Status::NeedsInput {
         return Err("agent no longer needs input".into());
     }
-    let prompt = parse(&tmux::capture(pane_id, CAPTURE_LINES)).ok_or("no permission dialog found on screen")?;
+    let prompt = parse(&mux::capture(pane_id, CAPTURE_LINES)).ok_or("no permission dialog found on screen")?;
     if prompt.fingerprint != seen {
         return Err("prompt changed; review it and try again".into());
     }
@@ -99,7 +99,7 @@ pub fn decide(pane_id: &str, d: Decision, seen: &str) -> Outcome {
     };
     let n = n.ok_or("dialog has no plain Yes/No option; answer in the pane")?;
     // A number key selects the option immediately; no Enter (it could land on a follow-up dialog).
-    tmux::run(&["send-keys", "-t", pane_id, &n.to_string()]);
+    mux::send_text(pane_id, &n.to_string());
     Ok(format!("{verb}: {}", st.message.or(st.tool).unwrap_or_default()))
 }
 
@@ -116,21 +116,21 @@ pub fn reply(pane_id: &str, text: &str) -> Outcome {
     if st.status == Status::Working {
         return Err("agent is working; wait for it to stop".into());
     }
-    if let Some(prompt) = parse(&tmux::capture(pane_id, CAPTURE_LINES)) {
+    if let Some(prompt) = parse(&mux::capture(pane_id, CAPTURE_LINES)) {
         if prompt.is_permission() {
             return Err("permission prompt: use [a]llow / [d]eny".into());
         }
         // A choice dialog: only a matching option number is safe to send.
         return match text.parse::<u32>() {
             Ok(n) if prompt.options.iter().any(|(o, _)| *o == n) => {
-                tmux::run(&["send-keys", "-t", pane_id, text]);
+                mux::send_text(pane_id, text);
                 Ok(format!("chose option {n}"))
             }
             _ => Err("choice dialog: reply with an option number, or answer in the pane".into()),
         };
     }
-    tmux::run(&["send-keys", "-t", pane_id, "-l", "--", text]);
-    tmux::run(&["send-keys", "-t", pane_id, "Enter"]);
+    mux::send_text(pane_id, text);
+    mux::send_enter(pane_id);
     Ok(format!("sent: {text}"))
 }
 

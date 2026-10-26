@@ -9,8 +9,10 @@ mod interact;
 mod lifecycle;
 mod list;
 mod model;
+mod mux;
 mod next;
 mod notify;
+mod rex;
 mod status;
 mod sync;
 mod state;
@@ -21,7 +23,7 @@ mod usage;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "cc-hud", about = "tmux HUD for Claude Code agents")]
+#[command(name = "cc-hud", about = "tmux / Rex HUD for Claude Code agents")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -70,14 +72,17 @@ enum Cmd {
         #[arg(long)]
         from: Option<String>,
     },
-    /// Full-screen agent dashboard (run inside `tmux display-popup`)
+    /// Full-screen agent dashboard (run inside `tmux display-popup`, or a Rex tab)
     Dashboard {
-        /// tmux client to switch when jumping (pass #{client_name})
+        /// Client to switch when jumping: tmux's #{client_name}, or a Rex client label (optional)
         #[arg(long)]
         client: Option<String>,
         /// Start in mission-control (tiled) view
         #[arg(long)]
         grid: bool,
+        /// Stay running when left, for a Rex tab that is switched to and from (see README)
+        #[arg(long)]
+        persistent: bool,
     },
     /// List repos and worktrees found under the root directory
     Repos {
@@ -89,7 +94,7 @@ enum Cmd {
         #[command(subcommand)]
         what: New,
     },
-    /// Attach to (or create) the workspace tmux session rooted at the root directory
+    /// Attach to (or create) the workspace session rooted at the root directory (tmux, or Rex)
     Open,
     /// Claude Code status line command: records plan usage limits for the dashboard,
     /// then runs --then (your previous status line) with the same input
@@ -121,7 +126,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Next { from } => next::run(from),
-        Cmd::Dashboard { client, grid } => dashboard::run(client, grid),
+        Cmd::Dashboard { client, grid, persistent } => dashboard::run(client, grid, persistent),
         Cmd::Repos { json } => {
             let repos = discover::scan(&config::root());
             if json {
@@ -155,6 +160,9 @@ fn main() -> anyhow::Result<()> {
         Cmd::Open => {
             use std::os::unix::process::CommandExt;
             let session = std::env::var("CC_HUD_SESSION").unwrap_or_else(|_| "dev".into());
+            if mux::active() == mux::Backend::Rex {
+                return rex::open(&session, &config::root());
+            }
             let err = std::process::Command::new("tmux")
                 .args(["new-session", "-A", "-s", &session, "-c"])
                 .arg(config::root())

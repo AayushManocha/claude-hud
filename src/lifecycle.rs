@@ -1,4 +1,4 @@
-use crate::config;
+use crate::{config, mux, rex};
 use crate::discover::{Repo, Worktree};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -45,6 +45,23 @@ fn unique_session(base: &str) -> String {
 /// Create a tagged, detached session with one window, start `claude` in it
 /// if asked, and switch the client to it.
 pub fn open_window(client: Option<&str>, w: &NewWindow) -> Result<()> {
+    match mux::active() {
+        mux::Backend::Tmux => open_tmux_window(client, w),
+        mux::Backend::Rex => {
+            let tags = rex::Tags {
+                kind: w.kind.into(),
+                repo: w.repo.map(String::from),
+                topic: w.topic.map(String::from),
+                path: w.cwd.display().to_string(),
+            };
+            let launch = w.launch.then(config::claude_cmd);
+            let (sid, wid) = rex::open_window(w.name, w.cwd, &tags, launch.as_deref())?;
+            rex::focus(client, &sid, &wid).map_err(|e| anyhow::anyhow!("opened {}, but {e}", w.name))
+        }
+    }
+}
+
+fn open_tmux_window(client: Option<&str>, w: &NewWindow) -> Result<()> {
     let name = unique_session(&session_name(w.name));
     let cwd = w.cwd.display().to_string();
     let created = tmux_out(&[
@@ -100,13 +117,26 @@ fn find_window(path: &Path) -> Option<(String, String)> {
     Some((sess, win))
 }
 
+/// Session ids are `session:…` in Rex, `$N` in tmux, so they say which backend they belong to.
+fn is_rex_session(id: &str) -> bool {
+    id.starts_with("session:")
+}
+
+/// An existing session for this worktree, in either backend.
+fn find_any(path: &Path) -> Option<(String, String)> {
+    find_window(path).or_else(|| rex::find_window(path))
+}
+
 pub fn window_name(repo: &str, wt: &Worktree) -> String {
     format!("{repo}/{}", wt.branch.as_deref().unwrap_or("detached"))
 }
 
 /// Open (or switch to the existing session for) a worktree, as a plain shell.
 pub fn open_worktree(client: Option<&str>, repo: &Repo, wt: &Worktree) -> Result<()> {
-    if let Some((s, w)) = find_window(&wt.path) {
+    if let Some((s, w)) = find_any(&wt.path) {
+        if is_rex_session(&s) {
+            return rex::focus(client, &s, &w).map_err(anyhow::Error::msg);
+        }
         focus(client, &s, &w);
         return Ok(());
     }
@@ -179,6 +209,9 @@ pub fn remove_worktree(client: Option<&str>, repo: &Repo, wt: &Worktree, force: 
         leave_session(client, &sess);
         crate::tmux::run(&["kill-session", "-t", &sess]);
     }
+    if let Some((sess, _)) = rex::find_window(&wt.path) {
+        rex::kill_session(&sess);
+    }
     std::fs::rename(&wt.path, &trash).with_context(|| format!("moving {} aside", wt.path.display()))?;
     let pruned = git(&repo.path, &["worktree", "prune"]);
     purge(&trash);
@@ -235,9 +268,14 @@ fn purge(dir: &Path) {
     }
 }
 
-/// Kill a chat's tmux session (and the agent in it).
+/// Kill a chat's session (and the agent in it); `session` is `PaneInfo::session_key`.
 pub fn kill_chat(session: &str) -> Result<String> {
-    if !crate::tmux::run(&["kill-session", "-t", &format!("={session}")]) {
+    let killed = if is_rex_session(session) {
+        rex::kill_session(session)
+    } else {
+        crate::tmux::run(&["kill-session", "-t", &format!("={session}")])
+    };
+    if !killed {
         bail!("couldn't kill session {session}");
     }
     Ok(format!("killed {session}"))

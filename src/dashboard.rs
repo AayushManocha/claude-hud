@@ -3,11 +3,12 @@ use crate::interact::{self, Decision};
 use crate::model::{self, Entry, Key, Kind, Row};
 use crate::state::{self, Status};
 use crate::transcript::{self, Transcript};
-use crate::{config, lifecycle, sync, tmux, usage};
+use crate::tmux::PaneInfo;
+use crate::{config, lifecycle, mux, sync, usage};
 use anyhow::Result;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
+    MouseEventKind, EnableFocusChange, DisableFocusChange,
 };
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -16,7 +17,9 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Para
 use ratatui::{DefaultTerminal, Frame};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// What the footer input line is collecting.
@@ -66,6 +69,13 @@ struct App {
     grid: bool,
     grid_cols: usize,
     tiles: HashMap<String, String>,
+    /// Screen captures are slow for some backends (Rex), so a thread takes them and keeps only
+    /// the newest request; results are picked up by `apply_captures`.
+    cap_tx: Sender<CaptureReq>,
+    cap_rx: Receiver<CaptureRes>,
+    peek_seq: u64,
+    peek_applied: u64,
+    tiles_pending: bool,
     filter: String,
     typing: bool,
     /// Pins from tmux config (read-only here) and pins saved from the dashboard.
@@ -93,6 +103,9 @@ struct App {
     msg: Option<(Result<String, String>, Instant)>,
     list: ListState,
     sel: Option<Key>,
+    /// Latest pane listing, refreshed in the background.
+    live: Option<HashMap<String, PaneInfo>>,
+    live_rx: Receiver<Option<HashMap<String, PaneInfo>>>,
     /// Where the last frame drew things, for hit-testing mouse events.
     list_area: Rect,
     grid_cells: Vec<(Rect, usize)>,
@@ -101,6 +114,11 @@ struct App {
     /// Row and time of the last click, to recognise a double-click.
     last_click: Option<(usize, Instant)>,
     quit: bool,
+    /// A dashboard that stays running (a Rex tab): leaving it goes back instead of exiting,
+    /// and it only polls while shown.
+    persistent: bool,
+    visible: Arc<AtomicBool>,
+    wake: Vec<Sender<()>>,
 }
 
 /// Lines captured for the live peek, and lines moved per wheel tick. Scrolling back captures the whole scrollback.
@@ -109,6 +127,7 @@ const PEEK_SCROLL_STEP: usize = 3;
 const TEXT: Color = Color::Rgb(235, 219, 178);
 const DIM: Color = Color::Rgb(146, 131, 116);
 const FAINT: Color = Color::Rgb(80, 73, 69);
+const BACKDROP: Color = Color::Rgb(40, 40, 40);
 const SURFACE: Color = Color::Rgb(60, 56, 54);
 const ACCENT: Color = Color::Rgb(131, 165, 152);
 const RED: Color = Color::Rgb(251, 73, 52);
@@ -126,6 +145,91 @@ fn status_color(s: Status) -> Color {
 fn status_style(s: Status) -> Style {
     let st = Style::new().fg(status_color(s));
     if s == Status::NeedsInput { st.add_modifier(Modifier::BOLD) } else { st }
+}
+
+/// Under Rex the dashboard can be a floating layer, and cells without a background colour let what
+/// is underneath show through. Give every cell one (`CC_HUD_OPAQUE=0|1` overrides).
+fn opaque() -> bool {
+    match std::env::var("CC_HUD_OPAQUE").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => mux::active() == mux::Backend::Rex,
+    }
+}
+
+fn fill_backdrop(f: &mut Frame, area: Rect) {
+    if opaque() {
+        f.render_widget(Block::new().style(Style::new().bg(BACKDROP)), area);
+    }
+}
+
+/// Hold back until `ready`, but for no longer than a moment.
+fn wait_ready(ready: &AtomicBool) {
+    let start = Instant::now();
+    while !ready.load(Ordering::Relaxed) && start.elapsed() < Duration::from_millis(1500) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+enum CaptureReq {
+    Peek { seq: u64, pane: String, all: bool },
+    Tiles(Vec<String>),
+}
+
+enum CaptureRes {
+    Peek { seq: u64, pane: String, text: String, ansi: String },
+    Tiles(HashMap<String, String>),
+}
+
+/// Takes screen captures off the UI thread. Requests that pile up while one is being served are
+/// dropped in favour of the newest of each kind, so scrolling through the list never queues work.
+fn spawn_capture_worker() -> (Sender<CaptureReq>, Receiver<CaptureRes>) {
+    let (req_tx, req_rx) = mpsc::channel::<CaptureReq>();
+    let (res_tx, res_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        while let Ok(first) = req_rx.recv() {
+            let (mut peek, mut tiles) = (None, None);
+            for r in std::iter::once(first).chain(req_rx.try_iter()) {
+                match r {
+                    r @ CaptureReq::Peek { .. } => peek = Some(r),
+                    r @ CaptureReq::Tiles(_) => tiles = Some(r),
+                }
+            }
+            if let Some(CaptureReq::Peek { seq, pane, all }) = peek {
+                let text = mux::capture(&pane, interact::CAPTURE_LINES);
+                let ansi = if all { mux::capture_ansi_all(&pane) } else { mux::capture_ansi(&pane, PEEK_LIVE) };
+                if res_tx.send(CaptureRes::Peek { seq, pane, text, ansi }).is_err() {
+                    return;
+                }
+            }
+            if let Some(CaptureReq::Tiles(panes)) = tiles {
+                let tiles = panes.into_iter().map(|p| { let t = mux::capture_ansi(&p, 40); (p, t) }).collect();
+                if res_tx.send(CaptureRes::Tiles(tiles)).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    (req_tx, res_rx)
+}
+
+fn live_cache_file() -> PathBuf {
+    state::state_dir().join("live.json")
+}
+
+fn load_live_cache() -> Option<HashMap<String, PaneInfo>> {
+    serde_json::from_slice(&std::fs::read(live_cache_file()).ok()?).ok()
+}
+
+/// Write `live` unless it is what `last` says was written already.
+fn save_live_cache(live: &HashMap<String, PaneInfo>, last: &mut String) {
+    // Sorted, so an unchanged listing serialises to the same text.
+    let sorted: std::collections::BTreeMap<_, _> = live.iter().collect();
+    let Ok(text) = serde_json::to_string(&sorted) else { return };
+    if text != *last {
+        let _ = std::fs::write(live_cache_file(), &text);
+        *last = text;
+    }
 }
 
 /// Truncate to `n` chars with an ellipsis.
@@ -156,17 +260,66 @@ fn age(secs: u64) -> String {
 }
 
 impl App {
-    fn new(client: Option<String>, grid: bool) -> Self {
+    fn new(client: Option<String>, grid: bool, persistent: bool, ready: Arc<AtomicBool>) -> Self {
+        let visible = Arc::new(AtomicBool::new(true));
+        let (cap_tx, cap_rx) = spawn_capture_worker();
+        // Listing panes can mean several subprocess calls (Rex, and slow while it is busy opening
+        // this very popup), so it runs off the UI thread. The first frame is drawn from the
+        // previous listing, kept on disk, rather than waiting for a fresh one.
+        let live = load_live_cache();
+        let (live_tx, live_rx) = mpsc::channel();
+        let (live_wake, live_wake_rx) = mpsc::channel::<()>();
+        let vis = visible.clone();
+        let wait = ready.clone();
+        std::thread::spawn(move || {
+            wait_ready(&wait);
+            let mut cached = String::new();
+            loop {
+                // Hidden: nothing to refresh until the dashboard is shown again.
+                while !vis.load(Ordering::Relaxed) {
+                    if live_wake_rx.recv().is_err() {
+                        return;
+                    }
+                }
+                let live = mux::live_panes();
+                if let Some(l) = &live {
+                    sync::live_agents(l); // prunes records of dead panes, against a listing that is fresh
+                    save_live_cache(l, &mut cached);
+                }
+                if live_tx.send(live).is_err() {
+                    break;
+                }
+                if let Err(RecvTimeoutError::Disconnected) = live_wake_rx.recv_timeout(Duration::from_millis(250)) {
+                    break;
+                }
+            }
+        });
         // Scanning runs git per repo, so keep it off the UI thread.
         let (tx, repo_rx) = mpsc::channel();
-        std::thread::spawn(move || loop {
-            if tx.send(discover::scan(&config::root())).is_err() {
-                break;
+        let (scan_wake, scan_wake_rx) = mpsc::channel::<()>();
+        let vis = visible.clone();
+        std::thread::spawn(move || {
+            wait_ready(&ready);
+            const EVERY: Duration = Duration::from_secs(10);
+            let mut last: Option<Instant> = None;
+            loop {
+                if last.is_none_or(|t| t.elapsed() >= EVERY) && vis.load(Ordering::Relaxed) {
+                    if tx.send(discover::scan(&config::root())).is_err() {
+                        break;
+                    }
+                    last = Some(Instant::now());
+                }
+                // Also wakes when shown again, to scan if the last scan is old.
+                let wait = last.map_or(Duration::ZERO, |t| EVERY.saturating_sub(t.elapsed()));
+                if let Err(RecvTimeoutError::Disconnected) = scan_wake_rx.recv_timeout(wait.max(Duration::from_millis(250))) {
+                    break;
+                }
             }
-            std::thread::sleep(Duration::from_secs(10));
         });
         let (removal_tx, removal_rx) = mpsc::channel();
         let mut a = App {
+            live,
+            live_rx,
             client,
             entries: vec![],
             rows: vec![],
@@ -179,6 +332,11 @@ impl App {
             grid,
             grid_cols: 1,
             tiles: HashMap::new(),
+            cap_tx,
+            cap_rx,
+            peek_seq: 0,
+            peek_applied: 0,
+            tiles_pending: false,
             filter: String::new(),
             typing: false,
             pinned: vec![],
@@ -206,10 +364,13 @@ impl App {
             picker_state: ListState::default(),
             last_click: None,
             quit: false,
+            persistent,
+            visible,
+            wake: vec![live_wake, scan_wake],
         };
         a.pinned = a.all_pins();
         // Start on the agent the user was just working in; refresh keeps `sel` if that row exists.
-        a.sel = tmux::current_pane(a.client.as_deref()).map(Key::Agent);
+        a.sel = mux::current_pane(a.client.as_deref()).map(Key::Agent);
         a.refresh();
         a
     }
@@ -280,6 +441,7 @@ impl App {
         let (w, h) = (a.width.min(60), a.height.min(20));
         let area = Rect::new(a.x + (a.width - w) / 2, a.y + (a.height - h) / 2, w, h);
         f.render_widget(Clear, area);
+        fill_backdrop(f, area);
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(ACCENT))
@@ -327,13 +489,14 @@ impl App {
 
     /// Reload state from disk/tmux, keeping the selection on the same row.
     fn refresh(&mut self) {
-        self.entries = match tmux::live_panes() {
-            Some(live) => sync::live_agents(&live)
+        while let Ok(l) = self.live_rx.try_recv() {
+            self.live = l;
+        }
+        self.entries = match &self.live {
+            Some(live) => sync::known_agents(live)
                 .into_iter()
-                .map(|a| {
-                    let p = live[&a.pane_id].clone();
-                    Entry { a, p }
-                })
+                // An agent of a multiplexer that wasn't reachable has a record but no pane to show.
+                .filter_map(|a| Some(Entry { p: live.get(&a.pane_id)?.clone(), a }))
                 .collect(),
             None => vec![],
         };
@@ -349,7 +512,10 @@ impl App {
             r.worktrees.retain(|w| !self.removing.contains_key(&w.path));
         }
         if self.grid {
-            self.tiles = self.entries.iter().map(|e| (e.a.pane_id.clone(), tmux::capture_ansi(&e.a.pane_id, 40))).collect();
+            let panes = self.entries.iter().map(|e| e.a.pane_id.clone()).collect();
+            if self.cap_tx.send(CaptureReq::Tiles(panes)).is_ok() {
+                self.tiles_pending = true;
+            }
         }
         self.usage = usage::load();
         self.rows = model::build(&self.entries, &self.repos, &self.pinned, &self.toggled, &self.filter);
@@ -422,27 +588,59 @@ impl App {
         }
     }
 
+    /// Ask for the selected agent's screen. It arrives later, through `apply_captures`; until then
+    /// the previous agent's screen is not shown, and `seen` is empty so nothing can be answered blind.
     fn refresh_peek(&mut self) {
         let pane = self.selected_entry().map(|e| e.a.pane_id.clone());
-        self.peek_text = match (self.peek && !self.grid, &pane) {
-            (true, Some(p)) => tmux::capture(p, interact::CAPTURE_LINES),
-            _ => String::new(),
-        };
         if pane != self.peek_pane {
             self.peek_scroll = 0;
             self.peek_pane = pane.clone();
+            self.peek_text.clear();
+            self.peek_ansi.clear();
+            self.seen = None;
         }
         self.sync_transcript();
-        self.peek_ansi = match (self.peek && !self.grid, &pane) {
-            (true, Some(p)) if self.peek_scroll > 0 && self.transcript.is_none() => tmux::capture_ansi_all(p),
-            (true, Some(p)) => tmux::capture_ansi(p, PEEK_LIVE),
-            _ => String::new(),
+        let Some(p) = pane.filter(|_| self.peek && !self.grid) else {
+            self.peek_text.clear();
+            self.peek_ansi.clear();
+            self.seen = None;
+            return;
         };
-        let seen = pane.and_then(|p| interact::parse(&self.peek_text).map(|d| (p, d.fingerprint)));
-        if seen != self.seen {
-            self.seen_at = Instant::now();
+        let all = self.peek_scroll > 0 && self.transcript.is_none();
+        self.peek_seq += 1;
+        let req = CaptureReq::Peek { seq: self.peek_seq, pane: p, all };
+        if self.cap_tx.send(req).is_err() {
+            self.peek_applied = self.peek_seq;
         }
-        self.seen = seen;
+    }
+
+    /// Take the captures that finished since the last call.
+    fn apply_captures(&mut self) {
+        while let Ok(res) = self.cap_rx.try_recv() {
+            match res {
+                CaptureRes::Peek { seq, pane, text, ansi } => {
+                    self.peek_applied = seq;
+                    if !self.peek || self.grid || self.peek_pane.as_ref() != Some(&pane) {
+                        continue;
+                    }
+                    let seen = interact::parse(&text).map(|d| (pane, d.fingerprint));
+                    if seen != self.seen {
+                        self.seen_at = Instant::now();
+                    }
+                    self.seen = seen;
+                    self.peek_text = text;
+                    self.peek_ansi = ansi;
+                }
+                CaptureRes::Tiles(tiles) => {
+                    self.tiles = tiles;
+                    self.tiles_pending = false;
+                }
+            }
+        }
+    }
+
+    fn captures_pending(&self) -> bool {
+        self.peek_seq != self.peek_applied || self.tiles_pending
     }
 
     fn say(&mut self, r: Result<String, String>) {
@@ -530,7 +728,7 @@ impl App {
 
     fn start_remove(&mut self) {
         if let Some(e) = self.selected_entry().filter(|e| e.p.is_chat()) {
-            self.confirm = Some(Confirm::Chat(e.p.session.clone(), model::label(e)));
+            self.confirm = Some(Confirm::Chat(e.p.session_key.clone(), model::label(e)));
             return;
         }
         let Some((ri, wi)) = self.selected_worktree() else {
@@ -607,7 +805,7 @@ impl App {
         match &r {
             Err(_) => self.input = Some((kind, text)),
             // New windows take focus; leave the popup so the user lands in them.
-            Ok(_) if !matches!(kind, InputKind::Reply) => self.quit = true,
+            Ok(_) if !matches!(kind, InputKind::Reply) => self.leave(false),
             Ok(_) => {}
         }
         self.say(r);
@@ -623,10 +821,41 @@ impl App {
         }
     }
 
+    /// Done with the dashboard. A plain one exits. A persistent one stays running for next time when
+    /// it is put away with q/esc (`go_back`: it is still on screen and hands the screen back). After
+    /// a jump or a new window the user is elsewhere, and it exits so no tab is left in the session
+    /// they were in.
+    fn leave(&mut self, go_back: bool) {
+        if !self.persistent || !go_back {
+            self.quit = true;
+            return;
+        }
+        self.filter.clear();
+        self.input = None;
+        self.confirm = None;
+        if let Err(e) = mux::leave_dashboard(self.client.as_deref()) {
+            self.say(Err(e));
+        }
+    }
+
+    fn shown(&mut self) {
+        self.visible.store(true, Ordering::Relaxed);
+        for w in &self.wake {
+            let _ = w.send(());
+        }
+        self.refresh();
+    }
+
+    fn hidden(&mut self) {
+        self.visible.store(false, Ordering::Relaxed);
+    }
+
     fn jump_to(&mut self, pane_id: &str) {
         if let Some(e) = self.entries.iter().find(|e| e.a.pane_id == pane_id) {
-            tmux::jump(self.client.as_deref(), &e.p, pane_id);
-            self.quit = true;
+            match mux::jump(self.client.as_deref(), &e.p, pane_id) {
+                Ok(()) => self.leave(false),
+                Err(e) => self.say(Err(e)),
+            }
         }
     }
 
@@ -648,7 +877,7 @@ impl App {
         };
         let r = &self.repos[repo];
         match lifecycle::open_worktree(self.client.as_deref(), r, &r.worktrees[wt]) {
-            Ok(()) => self.quit = true,
+            Ok(()) => self.leave(false),
             Err(e) => self.say(Err(e.to_string())),
         }
     }
@@ -819,8 +1048,8 @@ impl App {
             return;
         }
         match k.code {
-            KeyCode::Char('q') => self.quit = true,
-            KeyCode::Esc if self.filter.is_empty() => self.quit = true,
+            KeyCode::Char('q') => self.leave(true),
+            KeyCode::Esc if self.filter.is_empty() => self.leave(true),
             KeyCode::Esc => {
                 self.filter.clear();
                 self.refresh();
@@ -857,8 +1086,13 @@ impl App {
     }
 
     fn render(&mut self, f: &mut Frame) {
-        let [head, main, foot] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)]).areas(f.area());
+        fill_backdrop(f, f.area());
+        // Rex.app stretches the background of the last row into the padding below the grid, which
+        // makes the footer's key caps look too tall. A blank row beneath it takes the stretch instead.
+        let pad = u16::from(opaque());
+        let [head, main, foot, _] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1), Constraint::Length(pad)])
+                .areas(f.area());
         let peek_w = if self.peek && !self.grid { main.width * 11 / 20 } else { 0 };
         let [body, peek] = Layout::horizontal([Constraint::Min(20), Constraint::Length(peek_w)]).areas(main);
 
@@ -960,7 +1194,7 @@ impl App {
                         if e.p.is_chat() { format!("{} ", model::chat_title(e)) } else { format!("{}:{} ", e.p.session, e.p.window_name) },
                         Style::new().fg(TEXT),
                     ),
-                    Span::styled(format!("{} ", e.a.pane_id), Style::new().fg(FAINT)),
+                    Span::styled(format!("{} ", mux::short_id(&e.a.pane_id)), Style::new().fg(FAINT)),
                 ]),
                 None => Line::styled(" peek ", dim()),
             };
@@ -1076,12 +1310,26 @@ impl App {
             }
             Line::from(spans)
         } else {
+            // Most useful first; what doesn't fit the width is dropped from the end, never the way out.
+            let leave = if self.persistent { "back" } else { "quit" };
             let keys = [
-                ("⏎", "jump"), ("a", "allow"), ("d", "deny"), ("r", "reply"), ("w", "worktree"), ("x", "kill/remove"), ("c", "chat"),
-                ("P", "pin"), ("m", "grid"), ("/", "filter"), ("tab", "fold"), ("p", "peek"), ("n", "next"), ("q", "quit"),
+                ("⏎", "jump"), ("a", "allow"), ("d", "deny"), ("r", "reply"), ("w", "worktree"), ("c", "chat"), ("x", "kill/remove"),
+                ("m", "grid"), ("/", "filter"), ("P", "pin"), ("p", "peek"), ("tab", "fold"), ("n", "next"),
             ];
-            let mut spans = vec![];
+            let width = |k: &str, d: &str| k.chars().count() + 2 + d.chars().count() + 3;
+            let room = (area.width as usize).saturating_sub(width("q", leave));
+            let mut used = 0;
+            let mut shown: Vec<(&str, &str)> = vec![];
             for (k, d) in keys {
+                if used + width(k, d) > room {
+                    break;
+                }
+                used += width(k, d);
+                shown.push((k, d));
+            }
+            shown.push(("q", leave));
+            let mut spans = vec![];
+            for (k, d) in shown {
                 spans.push(Span::styled(format!(" {k} "), Style::new().fg(TEXT).bg(SURFACE).add_modifier(Modifier::BOLD)));
                 spans.push(Span::styled(format!(" {d}  "), dim()));
             }
@@ -1144,28 +1392,49 @@ impl App {
     }
 }
 
-pub fn run(client: Option<String>, grid: bool) -> Result<()> {
+pub fn run(client: Option<String>, grid: bool, persistent: bool) -> Result<()> {
     // An unexpanded `#{client_name}` means the launcher didn't substitute it.
     let client = client.filter(|c| !c.contains("#{"));
     let mut term: DefaultTerminal = ratatui::init();
     let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    if persistent {
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableFocusChange);
+    }
+    // Showing the tab is what the user is waiting for, so it goes first; the dashboard's other
+    // startup work (listing panes, scanning repos) would only slow the Rex calls it makes.
+    let ready = Arc::new(AtomicBool::new(!persistent));
+    if persistent {
+        let (client, ready) = (client.clone(), ready.clone());
+        std::thread::spawn(move || {
+            crate::rex::show_own_window(client.as_deref());
+            ready.store(true, Ordering::Relaxed);
+        });
+    }
     let res = (|| -> Result<()> {
-        let mut app = App::new(client, grid);
+        let mut app = App::new(client, grid, persistent, ready);
         while !app.quit {
-            term.draw(|f| app.render(f))?;
-            if event::poll(Duration::from_millis(300))? {
+            let shown = app.visible.load(Ordering::Relaxed);
+            app.apply_captures();
+            if shown {
+                term.draw(|f| app.render(f))?;
+            }
+            // While a capture is on its way, look again soon rather than at the next refresh.
+            let wait = if !shown { 1000 } else if app.captures_pending() { 20 } else { 300 };
+            if event::poll(Duration::from_millis(wait))? {
                 match event::read()? {
                     Event::Key(k) => app.on_key(k),
                     Event::Mouse(m) => app.on_mouse(m),
+                    Event::FocusGained if persistent => app.shown(),
+                    Event::FocusLost if persistent => app.hidden(),
                     _ => {}
                 }
-            } else {
+            } else if shown && !app.captures_pending() {
                 app.refresh();
             }
         }
         Ok(())
     })();
-    let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture, DisableFocusChange);
     ratatui::restore();
     res
 }
