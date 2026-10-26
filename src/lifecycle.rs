@@ -160,7 +160,7 @@ pub fn new_worktree(client: Option<&str>, repo: &Repo, branch: &str, launch: boo
 /// is free at once; deleting the files (`target/`, `node_modules/`…) is left to a detached
 /// `rm -rf` that outlives the dashboard.
 /// With `force`, uncommitted and untracked files in it are discarded.
-pub fn remove_worktree(repo: &Repo, wt: &Worktree, force: bool) -> Result<String> {
+pub fn remove_worktree(client: Option<&str>, repo: &Repo, wt: &Worktree, force: bool) -> Result<String> {
     if wt.path == repo.path {
         bail!("refusing to remove the main checkout of {}", repo.name);
     }
@@ -175,6 +175,8 @@ pub fn remove_worktree(repo: &Repo, wt: &Worktree, force: bool) -> Result<String
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let trash = wt.path.with_file_name(format!(".trash-{name}-{stamp}"));
     if let Some(sess) = find_session(&wt.path) {
+        // Killing the session a client is attached to would detach it; move it elsewhere first.
+        leave_session(client, &sess);
         crate::tmux::run(&["kill-session", "-t", &sess]);
     }
     std::fs::rename(&wt.path, &trash).with_context(|| format!("moving {} aside", wt.path.display()))?;
@@ -182,6 +184,37 @@ pub fn remove_worktree(repo: &Repo, wt: &Worktree, force: bool) -> Result<String
     purge(&trash);
     pruned?;
     Ok(format!("removed {}", wt.path.display()))
+}
+
+/// If `client` is attached to `session`, switch it to the most recently attached other
+/// worktree session (else any other session). The dashboard popup belongs to the client, so
+/// it stays open across the switch.
+fn leave_session(client: Option<&str>, session: &str) {
+    let mut cur = vec!["display-message", "-p"];
+    if let Some(c) = client {
+        cur.extend(["-c", c]);
+    }
+    cur.push("#{session_id}");
+    if tmux_out(&cur).as_deref() != Some(session) {
+        return;
+    }
+    let Some(list) = tmux_out(&["list-sessions", "-F", "#{session_id}\t#{session_last_attached}\t#{session_activity}\t#{@hud_kind}"]) else { return };
+    let target = list
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            let id = f.next()?;
+            let last: u64 = f.next()?.parse().unwrap_or(0);
+            let act: u64 = f.next()?.parse().unwrap_or(0);
+            (id != session).then(|| (f.next() == Some("worktree"), last.max(act), id.to_string()))
+        })
+        .max();
+    if let Some((_, _, id)) = target {
+        match client {
+            Some(c) => crate::tmux::run(&["switch-client", "-c", c, "-t", &id]),
+            None => crate::tmux::run(&["switch-client", "-t", &id]),
+        };
+    }
 }
 
 /// Delete `dir` in a detached process, so it finishes even if the dashboard closes first.
@@ -248,10 +281,10 @@ mod tests {
 
         // Dirty worktrees are refused and left intact.
         std::fs::write(dir.join("junk"), "x").unwrap();
-        let err = remove_worktree(&repo, &wt, false).unwrap_err().to_string();
+        let err = remove_worktree(None, &repo, &wt, false).unwrap_err().to_string();
         assert!(err.contains("--force"), "{err}");
         assert!(dir.exists());
-        remove_worktree(&repo, &wt, true).unwrap();
+        remove_worktree(None, &repo, &wt, true).unwrap();
         assert!(!dir.exists());
         let trash_left = |d: &Path| std::fs::read_dir(d).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with(".trash-"));
         let parent = dir.parent().unwrap();
@@ -264,7 +297,7 @@ mod tests {
         assert!(!trash_left(parent));
         assert!(!git(&main, &["worktree", "list"]).unwrap().contains("/feat"));
         let main_wt = Worktree { path: main.clone(), branch: None, last_used: 0 };
-        assert!(remove_worktree(&repo, &main_wt, true).is_err());
+        assert!(remove_worktree(None, &repo, &main_wt, true).is_err());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

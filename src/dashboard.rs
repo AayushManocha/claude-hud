@@ -555,9 +555,9 @@ impl App {
         // Hide the row now; git and the file deletion run off the UI thread.
         self.removing.insert(path.clone(), false);
         self.say(Ok(format!("removing {label}…")));
-        let (r, tx) = (self.repos[ri].clone(), self.removal_tx.clone());
+        let (r, tx, client) = (self.repos[ri].clone(), self.removal_tx.clone(), self.client.clone());
         std::thread::spawn(move || {
-            let result = lifecycle::remove_worktree(&r, &wt, force).map_err(|e| e.to_string());
+            let result = lifecycle::remove_worktree(client.as_deref(), &r, &wt, force).map_err(|e| e.to_string());
             let _ = tx.send(Removal { repo, path, label, force, result });
         });
         self.refresh();
