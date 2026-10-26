@@ -32,8 +32,8 @@ enum Confirm {
     /// Remove a linked worktree: (repo name, path, label, force). `force` is asked for
     /// only after git refused because of uncommitted changes.
     Worktree(String, PathBuf, String, bool),
-    /// Kill a chat's tmux session: (session name, label).
-    Chat(String, String),
+    /// Kill a chat's workspace: (its pane, label).
+    Chat(mux::PaneInfo, String),
 }
 
 /// Outcome of a background worktree removal.
@@ -528,7 +528,7 @@ impl App {
 
     fn start_remove(&mut self) {
         if let Some(e) = self.selected_entry().filter(|e| e.p.is_chat()) {
-            self.confirm = Some(Confirm::Chat(e.p.session.clone(), model::label(e)));
+            self.confirm = Some(Confirm::Chat(e.p.clone(), model::label(e)));
             return;
         }
         let Some((ri, wi)) = self.selected_worktree() else {
@@ -542,8 +542,8 @@ impl App {
     fn confirm_remove(&mut self) {
         let (repo, path, force) = match self.confirm.take() {
             Some(Confirm::Worktree(repo, path, _, force)) => (repo, path, force),
-            Some(Confirm::Chat(session, _)) => {
-                let r = lifecycle::kill_chat(&session).map_err(|e| e.to_string());
+            Some(Confirm::Chat(p, _)) => {
+                let r = lifecycle::kill_chat(&p).map_err(|e| e.to_string());
                 self.say(r);
                 return self.refresh();
             }
@@ -1040,7 +1040,7 @@ impl App {
                 Confirm::Worktree(_, _, l, true) => {
                     (" force remove ", format!("{l} has uncommitted or untracked files; discard them and close its session"))
                 }
-                Confirm::Chat(_, l) => (" kill chat ", format!("{l} and its session")),
+                Confirm::Chat(_, l) => (" kill chat ", format!("{l} and its agent")),
             };
             Line::from(vec![
                 Span::styled(title, Style::new().fg(Color::Black).bg(RED).add_modifier(Modifier::BOLD)),

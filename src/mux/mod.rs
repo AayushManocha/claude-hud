@@ -1,6 +1,8 @@
 //! Everything the HUD needs from a terminal multiplexer, behind one trait.
 //! Business logic (dashboard, lifecycle, notifications…) only talks to
 //! [`get`]; `tmux.rs` and `zellij.rs` hold the backend-specific commands.
+//!
+//! "Window" means one workspace per worktree/chat: a tmux session, or a zellij tab.
 
 mod tmux;
 mod zellij;
@@ -27,7 +29,7 @@ impl PaneInfo {
     }
 }
 
-/// A tagged, detached workspace (tmux session / zellij session) with one window.
+/// A tagged workspace with one pane: a detached tmux session, or a tab in a zellij session.
 pub struct NewWindow<'a> {
     pub name: &'a str,
     pub cwd: &'a Path,
@@ -65,7 +67,8 @@ pub trait Multiplexer: Send + Sync {
     fn focus_worktree(&self, client: Option<&str>, path: &Path) -> bool;
     /// Close the workspace tagged for this worktree path, if any.
     fn kill_worktree(&self, path: &Path);
-    fn kill_session(&self, name: &str) -> bool;
+    /// Close a chat's workspace (and the agent in it).
+    fn kill_chat(&self, p: &PaneInfo) -> bool;
     /// Unix seconds of last activity per tagged worktree path.
     fn session_activity(&self) -> HashMap<PathBuf, u64>;
 

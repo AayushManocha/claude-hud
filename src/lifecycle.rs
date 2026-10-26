@@ -1,4 +1,4 @@
-use crate::mux::{self, NewWindow};
+use crate::mux::{self, NewWindow, PaneInfo};
 use crate::discover::{Repo, Worktree};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -112,11 +112,11 @@ fn purge(dir: &Path) {
 }
 
 /// Kill a chat's session (and the agent in it).
-pub fn kill_chat(session: &str) -> Result<String> {
-    if !mux::get().kill_session(session) {
-        bail!("couldn't kill session {session}");
+pub fn kill_chat(p: &PaneInfo) -> Result<String> {
+    if !mux::get().kill_chat(p) {
+        bail!("couldn't kill chat {}", p.window_name);
     }
-    Ok(format!("killed {session}"))
+    Ok(format!("killed {}", p.window_name))
 }
 
 pub fn new_chat(client: Option<&str>, topic: &str, cwd: &Path) -> Result<String> {

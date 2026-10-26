@@ -180,8 +180,8 @@ impl Multiplexer for Tmux {
         }
     }
 
-    fn kill_session(&self, name: &str) -> bool {
-        run(&["kill-session", "-t", &format!("={name}")])
+    fn kill_chat(&self, p: &PaneInfo) -> bool {
+        run(&["kill-session", "-t", &format!("={}", p.session)])
     }
 
     fn session_activity(&self) -> HashMap<PathBuf, u64> {
