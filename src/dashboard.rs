@@ -208,6 +208,8 @@ impl App {
             quit: false,
         };
         a.pinned = a.all_pins();
+        // Start on the agent the user was just working in; refresh keeps `sel` if that row exists.
+        a.sel = tmux::current_pane(a.client.as_deref()).map(Key::Agent);
         a.refresh();
         a
     }
