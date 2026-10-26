@@ -15,6 +15,7 @@ mod status;
 mod sync;
 mod state;
 mod tmux;
+mod transcript;
 mod usage;
 
 use clap::{Parser, Subcommand};
