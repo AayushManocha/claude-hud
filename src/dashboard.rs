@@ -2,6 +2,7 @@ use crate::discover::{self, Repo};
 use crate::interact::{self, Decision};
 use crate::model::{self, Entry, Key, Kind, Row};
 use crate::state::{self, Status};
+use crate::transcript::{self, Transcript};
 use crate::{config, lifecycle, sync, tmux, usage};
 use anyhow::Result;
 use ratatui::crossterm::event::{
@@ -79,6 +80,8 @@ struct App {
     /// Lines the peek is scrolled up from the bottom of the pane; 0 follows the live output.
     peek_scroll: usize,
     peek_pane: Option<String>,
+    /// Session transcript shown instead of the pane while scrolled up, if the agent has one.
+    transcript: Option<Transcript>,
     peek_area: Rect,
     /// Fingerprint of the dialog the user is currently looking at in the peek.
     seen: Option<(String, String)>,
@@ -187,6 +190,7 @@ impl App {
             peek_ansi: String::new(),
             peek_scroll: 0,
             peek_pane: None,
+            transcript: None,
             peek_area: Rect::default(),
             seen: None,
             seen_at: Instant::now(),
@@ -390,6 +394,32 @@ impl App {
         self.refresh_peek();
     }
 
+    /// Keep the transcript loaded and current while scrolled up; drop it when following live output.
+    fn sync_transcript(&mut self) {
+        if self.peek_scroll == 0 || !self.peek || self.grid {
+            self.transcript = None;
+            return;
+        }
+        let Some((cwd, sid)) = self.selected_entry().map(|e| (e.a.cwd.clone(), e.a.session_id.clone())) else {
+            self.transcript = None;
+            return;
+        };
+        let width = self.peek_area.width.saturating_sub(2);
+        let fresh = self.transcript.as_ref().is_none_or(|t| t.session_id != sid);
+        if fresh {
+            self.transcript = transcript::find(&cwd, &sid).map(|path| Transcript::open(path, sid));
+        }
+        if let Some(t) = self.transcript.as_mut() {
+            let before = t.lines(width).len();
+            t.update();
+            let after = t.lines(width).len();
+            // Keep the lines being read in place as the conversation grows below them.
+            if !fresh {
+                self.peek_scroll += after - before;
+            }
+        }
+    }
+
     fn refresh_peek(&mut self) {
         let pane = self.selected_entry().map(|e| e.a.pane_id.clone());
         self.peek_text = match (self.peek && !self.grid, &pane) {
@@ -400,8 +430,9 @@ impl App {
             self.peek_scroll = 0;
             self.peek_pane = pane.clone();
         }
+        self.sync_transcript();
         self.peek_ansi = match (self.peek && !self.grid, &pane) {
-            (true, Some(p)) if self.peek_scroll > 0 => tmux::capture_ansi_all(p),
+            (true, Some(p)) if self.peek_scroll > 0 && self.transcript.is_none() => tmux::capture_ansi_all(p),
             (true, Some(p)) => tmux::capture_ansi(p, PEEK_LIVE),
             _ => String::new(),
         };
@@ -937,11 +968,22 @@ impl App {
                 block = block.title_bottom(Line::styled(format!(" ↑{} lines up ", self.peek_scroll), Style::new().fg(YELLOW)).right_aligned());
             }
             let inner = block.inner(peek);
-            let mut lines = crate::ansi::lines(&self.peek_ansi);
+            let mut lines = if self.peek_scroll > 0 && self.transcript.is_some() {
+                vec![]
+            } else {
+                crate::ansi::lines(&self.peek_ansi)
+            };
             while lines.last().is_some_and(|l| l.spans.iter().all(|s| s.content.trim().is_empty())) {
                 lines.pop();
             }
-            let body_text = if lines.is_empty() {
+            let body_text = if let (true, Some(t)) = (self.peek_scroll > 0, self.transcript.as_mut()) {
+                let all = t.lines(inner.width);
+                let max_scroll = all.len().saturating_sub(inner.height as usize);
+                self.peek_scroll = self.peek_scroll.min(max_scroll);
+                let skip = max_scroll - self.peek_scroll;
+                let end = (skip + inner.height as usize).min(all.len());
+                Paragraph::new(all[skip..end].to_vec())
+            } else if lines.is_empty() {
                 Paragraph::new("\n  select an agent to peek at its pane").style(Style::new().fg(FAINT))
             } else {
                 let max_scroll = lines.len().saturating_sub(inner.height as usize);
