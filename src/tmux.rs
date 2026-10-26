@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::process::Command;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PaneInfo {
+    /// Display name of the session.
     pub session: String,
+    /// What the backend targets the session by: the tmux session name, or the Rex session id.
+    pub session_key: String,
     pub window_id: String,
     pub window_name: String,
     /// `worktree` | `chat` (option `@hud_kind`, set on the session; falls back to a `chat:` name prefix)
@@ -38,10 +41,13 @@ pub fn live_panes() -> Option<HashMap<String, PaneInfo>> {
         .lines()
         .filter_map(|l| {
             let mut f = l.split('\t');
+            let pane = f.next()?.to_string();
+            let session = f.next()?.to_string();
             Some((
-                f.next()?.to_string(),
+                pane,
                 PaneInfo {
-                    session: f.next()?.to_string(),
+                    session_key: session.clone(),
+                    session,
                     window_id: f.next()?.to_string(),
                     window_name: f.next()?.to_string(),
                     kind: f.next().unwrap_or("").to_string(),
@@ -82,6 +88,14 @@ pub fn current_pane(client: Option<&str>) -> Option<String> {
     let id = out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
     id.filter(|s| s.starts_with('%'))
         .or_else(|| std::env::var("TMUX_PANE").ok().filter(|s| !s.is_empty()))
+}
+
+/// Is this pane the one the user is looking at right now?
+pub fn visible(pane: &str) -> bool {
+    Command::new("tmux")
+        .args(["display-message", "-p", "-t", pane, "#{window_active} #{session_attached} #{pane_active}"])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "1 1 1")
 }
 
 /// Last `lines` lines of a pane's visible content, for the peek view.

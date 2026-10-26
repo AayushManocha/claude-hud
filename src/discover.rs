@@ -62,6 +62,9 @@ fn git_activity(wt: &Path) -> u64 {
 
 /// Last activity of tmux sessions tagged with a worktree path (`@hud_path`).
 fn session_activity() -> HashMap<PathBuf, u64> {
+    if crate::mux::active() != crate::mux::Backend::Tmux {
+        return HashMap::new(); // Rex doesn't report session activity
+    }
     let out = Command::new("tmux")
         .args(["list-sessions", "-F", "#{@hud_path}\t#{session_activity}"])
         .output();

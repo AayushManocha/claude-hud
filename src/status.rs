@@ -1,11 +1,11 @@
 use crate::state::Status;
-use crate::{sync, tmux};
+use crate::{mux, sync};
 
 /// One-line summary for `#(cc-hud status)` in the tmux status bar.
 /// Also refreshes the per-window glyphs, since tmux polls this every
 /// `status-interval` and that covers agents that died without a hook.
 pub fn run(color: bool) {
-    let Some(live) = tmux::live_panes() else { return };
+    let Some(live) = mux::live_panes() else { return };
     sync::run();
     let agents = sync::live_agents(&live);
 

@@ -1,4 +1,4 @@
-use crate::{state, sync, tmux};
+use crate::{mux, state, sync};
 use anyhow::Result;
 
 fn age(secs: u64) -> String {
@@ -10,7 +10,7 @@ fn age(secs: u64) -> String {
 }
 
 pub fn run(json: bool) -> Result<()> {
-    let live = tmux::live_panes();
+    let live = mux::live_panes();
     let mut agents = state::load_all();
 
     if let Some(live) = &live {
