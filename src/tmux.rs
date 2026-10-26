@@ -70,6 +70,20 @@ pub fn jump(client: Option<&str>, p: &PaneInfo, pane_id: &str) {
     run(&["select-pane", "-t", pane_id]);
 }
 
+/// The pane the client was focused on, i.e. what the user was just working in.
+/// Falls back to `$TMUX_PANE` when no client is known.
+pub fn current_pane(client: Option<&str>) -> Option<String> {
+    let mut cmd = Command::new("tmux");
+    cmd.arg("display-message");
+    if let Some(c) = client {
+        cmd.args(["-c", c]);
+    }
+    let out = cmd.args(["-p", "#{pane_id}"]).output().ok().filter(|o| o.status.success());
+    let id = out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    id.filter(|s| s.starts_with('%'))
+        .or_else(|| std::env::var("TMUX_PANE").ok().filter(|s| !s.is_empty()))
+}
+
 /// Last `lines` lines of a pane's visible content, for the peek view.
 pub fn capture(pane_id: &str, lines: usize) -> String {
     let start = format!("-{lines}");
