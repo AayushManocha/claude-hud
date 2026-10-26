@@ -76,6 +76,10 @@ struct App {
     peek_text: String,
     /// Same capture with colour codes, for display only.
     peek_ansi: String,
+    /// Lines the peek is scrolled up from the bottom of the pane; 0 follows the live output.
+    peek_scroll: usize,
+    peek_pane: Option<String>,
+    peek_area: Rect,
     /// Fingerprint of the dialog the user is currently looking at in the peek.
     seen: Option<(String, String)>,
     /// When `seen` last changed; decisions right after a change are refused.
@@ -96,6 +100,9 @@ struct App {
     quit: bool,
 }
 
+/// Scrollback lines captured for the peek, and lines moved per wheel tick.
+const PEEK_HISTORY: usize = 1000;
+const PEEK_SCROLL_STEP: usize = 3;
 const TEXT: Color = Color::Rgb(235, 219, 178);
 const DIM: Color = Color::Rgb(146, 131, 116);
 const FAINT: Color = Color::Rgb(80, 73, 69);
@@ -178,6 +185,9 @@ impl App {
             peek: true,
             peek_text: String::new(),
             peek_ansi: String::new(),
+            peek_scroll: 0,
+            peek_pane: None,
+            peek_area: Rect::default(),
             seen: None,
             seen_at: Instant::now(),
             input: None,
@@ -386,8 +396,12 @@ impl App {
             (true, Some(p)) => tmux::capture(p, interact::CAPTURE_LINES),
             _ => String::new(),
         };
+        if pane != self.peek_pane {
+            self.peek_scroll = 0;
+            self.peek_pane = pane.clone();
+        }
         self.peek_ansi = match (self.peek && !self.grid, &pane) {
-            (true, Some(p)) => tmux::capture_ansi(p, interact::CAPTURE_LINES),
+            (true, Some(p)) => tmux::capture_ansi(p, PEEK_HISTORY),
             _ => String::new(),
         };
         let seen = pane.and_then(|p| interact::parse(&self.peek_text).map(|d| (p, d.fingerprint)));
@@ -656,6 +670,14 @@ impl App {
         }
         let (x, y) = (m.column, m.row);
         let up = matches!(m.kind, MouseEventKind::ScrollUp);
+        let in_peek = self.peek && !self.grid && self.picker.is_none() && {
+            let a = self.peek_area;
+            x >= a.x && x < a.x + a.width && y >= a.y && y < a.y + a.height
+        };
+        if in_peek && matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+            self.peek_scroll = if up { self.peek_scroll + PEEK_SCROLL_STEP } else { self.peek_scroll.saturating_sub(PEEK_SCROLL_STEP) };
+            return;
+        }
         if self.picker.is_some() {
             let a = self.picker_list;
             let hit = x >= a.x && x < a.x + a.width && y >= a.y && y < a.y + a.height;
@@ -815,6 +837,7 @@ impl App {
         f.render_widget(Line::from(self.usage_spans(head_r.width as usize)).right_aligned(), head_r);
 
         self.list_area = Rect::default();
+        self.peek_area = Rect::default();
         self.grid_cells.clear();
         if self.grid {
             self.render_grid(f, main);
@@ -902,7 +925,11 @@ impl App {
                 ]),
                 None => Line::styled(" peek ", dim()),
             };
-            let block = panel().title(title);
+            self.peek_area = peek;
+            let mut block = panel().title(title);
+            if self.peek_scroll > 0 {
+                block = block.title_bottom(Line::styled(format!(" ↑{} lines up ", self.peek_scroll), Style::new().fg(YELLOW)).right_aligned());
+            }
             let inner = block.inner(peek);
             let mut lines = crate::ansi::lines(&self.peek_ansi);
             while lines.last().is_some_and(|l| l.spans.iter().all(|s| s.content.trim().is_empty())) {
@@ -911,8 +938,11 @@ impl App {
             let body_text = if lines.is_empty() {
                 Paragraph::new("\n  select an agent to peek at its pane").style(Style::new().fg(FAINT))
             } else {
-                let skip = lines.len().saturating_sub(inner.height as usize);
-                Paragraph::new(lines.split_off(skip))
+                let max_scroll = lines.len().saturating_sub(inner.height as usize);
+                self.peek_scroll = self.peek_scroll.min(max_scroll);
+                let skip = max_scroll - self.peek_scroll;
+                let end = (skip + inner.height as usize).min(lines.len());
+                Paragraph::new(lines[skip..end].to_vec())
             };
             f.render_widget(body_text.block(block), peek);
         }
