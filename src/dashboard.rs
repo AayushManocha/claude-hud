@@ -4,7 +4,10 @@ use crate::model::{self, Entry, Key, Kind, Row};
 use crate::state::{self, Status};
 use crate::{config, lifecycle, sync, tmux, usage};
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -83,6 +86,13 @@ struct App {
     msg: Option<(Result<String, String>, Instant)>,
     list: ListState,
     sel: Option<Key>,
+    /// Where the last frame drew things, for hit-testing mouse events.
+    list_area: Rect,
+    grid_cells: Vec<(Rect, usize)>,
+    picker_list: Rect,
+    picker_state: ListState,
+    /// Row and time of the last click, to recognise a double-click.
+    last_click: Option<(usize, Instant)>,
     quit: bool,
 }
 
@@ -176,6 +186,11 @@ impl App {
             msg: None,
             list: ListState::default(),
             sel: None,
+            list_area: Rect::default(),
+            grid_cells: vec![],
+            picker_list: Rect::default(),
+            picker_state: ListState::default(),
+            last_click: None,
             quit: false,
         };
         a.pinned = a.all_pins();
@@ -242,8 +257,9 @@ impl App {
         }
     }
 
-    fn render_picker(&self, f: &mut Frame) {
+    fn render_picker(&mut self, f: &mut Frame) {
         let Some(p) = &self.picker else { return };
+        let (query, psel) = (p.query.clone(), p.sel);
         let a = f.area();
         let (w, h) = (a.width.min(60), a.height.min(20));
         let area = Rect::new(a.x + (a.width - w) / 2, a.y + (a.height - h) / 2, w, h);
@@ -256,10 +272,11 @@ impl App {
         let inner = block.inner(area);
         f.render_widget(block, area);
         let [q, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+        self.picker_list = list;
         f.render_widget(
             Line::from(vec![
                 Span::styled(" ", Style::new().fg(ACCENT)),
-                Span::styled(p.query.clone(), Style::new().fg(TEXT)),
+                Span::styled(query, Style::new().fg(TEXT)),
                 Span::styled("▏", Style::new().fg(ACCENT)),
             ]),
             q,
@@ -286,8 +303,9 @@ impl App {
         if items.is_empty() {
             f.render_widget(Paragraph::new("  no matching repos").style(dim()), list);
         } else {
-            let mut st = ListState::default().with_selected(Some(p.sel.min(items.len() - 1)));
-            f.render_stateful_widget(List::new(items).highlight_style(Style::new().bg(SURFACE).add_modifier(Modifier::BOLD)), list, &mut st);
+            self.picker_state.select(Some(psel.min(items.len() - 1)));
+            let hl = Style::new().bg(SURFACE).add_modifier(Modifier::BOLD);
+            f.render_stateful_widget(List::new(items).highlight_style(hl), list, &mut self.picker_state);
         }
     }
 
@@ -623,6 +641,74 @@ impl App {
         }
     }
 
+    /// Row index under a terminal cell in the list view.
+    fn list_row_at(&self, x: u16, y: u16) -> Option<usize> {
+        let a = self.list_area;
+        if x < a.x || x >= a.x + a.width || y < a.y || y >= a.y + a.height {
+            return None;
+        }
+        Some(self.list.offset() + (y - a.y) as usize).filter(|&i| i < self.rows.len())
+    }
+
+    fn on_mouse(&mut self, m: MouseEvent) {
+        if self.confirm.is_some() || self.input.is_some() {
+            return;
+        }
+        let (x, y) = (m.column, m.row);
+        let up = matches!(m.kind, MouseEventKind::ScrollUp);
+        if self.picker.is_some() {
+            let a = self.picker_list;
+            let hit = x >= a.x && x < a.x + a.width && y >= a.y && y < a.y + a.height;
+            match m.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    if let Some(p) = self.picker.as_mut() {
+                        p.sel = if up { p.sel.saturating_sub(1) } else { p.sel + 1 };
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) if hit => {
+                    let i = self.picker_state.offset() + (y - a.y) as usize;
+                    if i < self.picker_matches().len() {
+                        if let Some(p) = self.picker.as_mut() {
+                            p.sel = i;
+                        }
+                        self.toggle_pin();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        match m.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let d = if up { -1 } else { 1 };
+                if self.grid {
+                    self.move_agent(d * self.grid_cols as isize);
+                } else {
+                    self.move_by(d);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let idx = if self.grid {
+                    self.grid_cells.iter().find(|(r, _)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height).map(|&(_, i)| i)
+                } else {
+                    self.list_row_at(x, y)
+                };
+                let Some(idx) = idx else { return };
+                let double = self.last_click.take().is_some_and(|(i, t)| i == idx && t.elapsed() < Duration::from_millis(400));
+                self.select(Some(idx));
+                self.refresh_peek();
+                if matches!(self.rows[idx].kind, Kind::Group { .. }) {
+                    self.toggle_fold();
+                } else if double {
+                    self.jump_selected();
+                } else {
+                    self.last_click = Some((idx, Instant::now()));
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn on_key(&mut self, k: KeyEvent) {
         if k.kind != KeyEventKind::Press {
             return;
@@ -728,6 +814,8 @@ impl App {
         f.render_widget(Line::from(title), head_l);
         f.render_widget(Line::from(self.usage_spans(head_r.width as usize)).right_aligned(), head_r);
 
+        self.list_area = Rect::default();
+        self.grid_cells.clear();
         if self.grid {
             self.render_grid(f, main);
             self.render_footer(f, foot);
@@ -791,6 +879,7 @@ impl App {
             f.render_widget(Paragraph::new(format!("\n  {msg}")).style(Style::new().fg(FAINT)).block(list_block), body);
         } else {
             let inner = list_block.inner(body);
+            self.list_area = inner;
             f.render_widget(list_block, body);
             f.render_stateful_widget(
                 List::new(items)
@@ -944,6 +1033,7 @@ impl App {
             let cell = Layout::horizontal((0..cols).map(|_| Constraint::Ratio(1, cols as u32))).split(row_areas[n / cols])[n % cols];
             let e = &self.entries[ei];
             let selected = Some(ri) == self.list.selected();
+            self.grid_cells.push((cell, ri));
             let name = if e.p.is_chat() {
                 model::chat_title(e)
             } else {
@@ -978,13 +1068,16 @@ pub fn run(client: Option<String>, grid: bool) -> Result<()> {
     // An unexpanded `#{client_name}` means the launcher didn't substitute it.
     let client = client.filter(|c| !c.contains("#{"));
     let mut term: DefaultTerminal = ratatui::init();
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let res = (|| -> Result<()> {
         let mut app = App::new(client, grid);
         while !app.quit {
             term.draw(|f| app.render(f))?;
             if event::poll(Duration::from_millis(300))? {
-                if let Event::Key(k) = event::read()? {
-                    app.on_key(k);
+                match event::read()? {
+                    Event::Key(k) => app.on_key(k),
+                    Event::Mouse(m) => app.on_mouse(m),
+                    _ => {}
                 }
             } else {
                 app.refresh();
@@ -992,6 +1085,7 @@ pub fn run(client: Option<String>, grid: bool) -> Result<()> {
         }
         Ok(())
     })();
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res
 }
