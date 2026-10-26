@@ -89,3 +89,12 @@ pub fn capture_ansi(pane_id: &str, lines: usize) -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default()
 }
+
+/// Like `capture_ansi`, but from the very start of the pane's scrollback.
+pub fn capture_ansi_all(pane_id: &str) -> String {
+    Command::new("tmux")
+        .args(["capture-pane", "-p", "-e", "-t", pane_id, "-S", "-"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}

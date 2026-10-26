@@ -100,8 +100,8 @@ struct App {
     quit: bool,
 }
 
-/// Scrollback lines captured for the peek, and lines moved per wheel tick.
-const PEEK_HISTORY: usize = 1000;
+/// Lines captured for the live peek, and lines moved per wheel tick. Scrolling back captures the whole scrollback.
+const PEEK_LIVE: usize = 200;
 const PEEK_SCROLL_STEP: usize = 3;
 const TEXT: Color = Color::Rgb(235, 219, 178);
 const DIM: Color = Color::Rgb(146, 131, 116);
@@ -401,7 +401,8 @@ impl App {
             self.peek_pane = pane.clone();
         }
         self.peek_ansi = match (self.peek && !self.grid, &pane) {
-            (true, Some(p)) => tmux::capture_ansi(p, PEEK_HISTORY),
+            (true, Some(p)) if self.peek_scroll > 0 => tmux::capture_ansi_all(p),
+            (true, Some(p)) => tmux::capture_ansi(p, PEEK_LIVE),
             _ => String::new(),
         };
         let seen = pane.and_then(|p| interact::parse(&self.peek_text).map(|d| (p, d.fingerprint)));
@@ -675,7 +676,12 @@ impl App {
             x >= a.x && x < a.x + a.width && y >= a.y && y < a.y + a.height
         };
         if in_peek && matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
-            self.peek_scroll = if up { self.peek_scroll + PEEK_SCROLL_STEP } else { self.peek_scroll.saturating_sub(PEEK_SCROLL_STEP) };
+            let was = self.peek_scroll;
+            self.peek_scroll = if up { was + PEEK_SCROLL_STEP } else { was.saturating_sub(PEEK_SCROLL_STEP) };
+            // Leaving or entering the live view changes how much history is captured.
+            if (was == 0) != (self.peek_scroll == 0) {
+                self.refresh_peek();
+            }
             return;
         }
         if self.picker.is_some() {
