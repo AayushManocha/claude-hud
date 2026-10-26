@@ -34,7 +34,7 @@ Restart running Claude sessions so they pick up the hooks.
 Dashboard: `enter`/`space` jump/open, `a` allow once, `d` deny, `r` reply, `w` new worktree, `x` remove worktree / kill chat (confirms, offers force if dirty; keeps the branch),
 `c` new chat, `P` pin repos (fuzzy picker), `m` list/grid, `/` filter, `tab` fold, `p` peek, `n` next waiting, `q` quit.
 
-Mouse: click a row (or grid tile) to select it, double-click to jump, click a repo header to fold it, scroll wheel to move; in the pin picker, click to toggle.
+Mouse: click a row (or grid tile) to select it, double-click to jump, click a repo header to fold it, scroll wheel to move (over the preview, it scrolls back through the agent's output); in the pin picker, click to toggle.
 
 ## CLI
 
