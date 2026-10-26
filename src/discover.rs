@@ -1,5 +1,4 @@
 use serde::Serialize;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -7,7 +6,7 @@ use std::process::Command;
 pub struct Worktree {
     pub path: PathBuf,
     pub branch: Option<String>,
-    /// Unix seconds of the last sign of use (git activity or tmux session activity); 0 if unknown.
+    /// Unix seconds of the last sign of use (git activity or session activity); 0 if unknown.
     pub last_used: u64,
 }
 
@@ -60,21 +59,6 @@ fn git_activity(wt: &Path) -> u64 {
     ["index", "HEAD", "logs/HEAD"].iter().map(|f| mtime(&gitdir.join(f))).max().unwrap_or(0)
 }
 
-/// Last activity of tmux sessions tagged with a worktree path (`@hud_path`).
-fn session_activity() -> HashMap<PathBuf, u64> {
-    let out = Command::new("tmux")
-        .args(["list-sessions", "-F", "#{@hud_path}\t#{session_activity}"])
-        .output();
-    let Some(out) = out.ok().filter(|o| o.status.success()) else { return HashMap::new() };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| {
-            let (p, t) = l.split_once('\t')?;
-            Some((PathBuf::from(p), t.parse().ok()?))
-        })
-        .collect()
-}
-
 pub fn parse_worktrees(porcelain: &str) -> Vec<Worktree> {
     let mut out = vec![];
     for block in porcelain.split("\n\n") {
@@ -121,7 +105,7 @@ pub fn scan(root: &Path) -> Vec<Repo> {
             }
         }
     }
-    let sessions = session_activity();
+    let sessions = crate::mux::get().session_activity();
     for wt in found.iter_mut().flat_map(|r| r.worktrees.iter_mut()) {
         if let Some(&t) = sessions.get(&wt.path) {
             wt.last_used = wt.last_used.max(t);

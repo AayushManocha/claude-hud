@@ -3,7 +3,7 @@ use crate::interact::{self, Decision};
 use crate::model::{self, Entry, Key, Kind, Row};
 use crate::state::{self, Status};
 use crate::transcript::{self, Transcript};
-use crate::{config, lifecycle, sync, tmux, usage};
+use crate::{config, lifecycle, mux, sync, usage};
 use anyhow::Result;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -325,7 +325,7 @@ impl App {
 
     /// Reload state from disk/tmux, keeping the selection on the same row.
     fn refresh(&mut self) {
-        self.entries = match tmux::live_panes() {
+        self.entries = match mux::get().live_panes() {
             Some(live) => sync::live_agents(&live)
                 .into_iter()
                 .map(|a| {
@@ -347,7 +347,7 @@ impl App {
             r.worktrees.retain(|w| !self.removing.contains_key(&w.path));
         }
         if self.grid {
-            self.tiles = self.entries.iter().map(|e| (e.a.pane_id.clone(), tmux::capture_ansi(&e.a.pane_id, 40))).collect();
+            self.tiles = self.entries.iter().map(|e| (e.a.pane_id.clone(), mux::get().capture_ansi(&e.a.pane_id, 40))).collect();
         }
         self.usage = usage::load();
         self.rows = model::build(&self.entries, &self.repos, &self.pinned, &self.toggled, &self.filter);
@@ -423,7 +423,7 @@ impl App {
     fn refresh_peek(&mut self) {
         let pane = self.selected_entry().map(|e| e.a.pane_id.clone());
         self.peek_text = match (self.peek && !self.grid, &pane) {
-            (true, Some(p)) => tmux::capture(p, interact::CAPTURE_LINES),
+            (true, Some(p)) => mux::get().capture(p, interact::CAPTURE_LINES),
             _ => String::new(),
         };
         if pane != self.peek_pane {
@@ -432,8 +432,8 @@ impl App {
         }
         self.sync_transcript();
         self.peek_ansi = match (self.peek && !self.grid, &pane) {
-            (true, Some(p)) if self.peek_scroll > 0 && self.transcript.is_none() => tmux::capture_ansi_all(p),
-            (true, Some(p)) => tmux::capture_ansi(p, PEEK_LIVE),
+            (true, Some(p)) if self.peek_scroll > 0 && self.transcript.is_none() => mux::get().capture_ansi_all(p),
+            (true, Some(p)) => mux::get().capture_ansi(p, PEEK_LIVE),
             _ => String::new(),
         };
         let seen = pane.and_then(|p| interact::parse(&self.peek_text).map(|d| (p, d.fingerprint)));
@@ -623,7 +623,7 @@ impl App {
 
     fn jump_to(&mut self, pane_id: &str) {
         if let Some(e) = self.entries.iter().find(|e| e.a.pane_id == pane_id) {
-            tmux::jump(self.client.as_deref(), &e.p, pane_id);
+            mux::get().jump(self.client.as_deref(), &e.p, pane_id);
             self.quit = true;
         }
     }

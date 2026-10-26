@@ -1,13 +1,8 @@
-use crate::config;
+use crate::mux::{self, NewWindow};
 use crate::discover::{Repo, Worktree};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-fn tmux_out(args: &[&str]) -> Option<String> {
-    let o = Command::new("tmux").args(args).output().ok()?;
-    o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
-}
 
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let o = Command::new("git").arg("-C").arg(dir).args(args).output().context("running git")?;
@@ -17,100 +12,16 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
-pub struct NewWindow<'a> {
-    pub name: &'a str,
-    pub cwd: &'a Path,
-    pub kind: &'a str,
-    pub repo: Option<&'a str>,
-    pub topic: Option<&'a str>,
-    pub launch: bool,
-}
-
-/// tmux session names can't contain `.` or `:`.
-fn session_name(name: &str) -> String {
-    name.replace(['.', ':'], "-")
-}
-
-/// `base`, or `base-2`, `base-3`… if a session by that name already exists.
-fn unique_session(base: &str) -> String {
-    let mut name = base.to_string();
-    let mut n = 1;
-    while crate::tmux::run(&["has-session", "-t", &format!("={name}")]) {
-        n += 1;
-        name = format!("{base}-{n}");
-    }
-    name
-}
-
-/// Create a tagged, detached session with one window, start `claude` in it
-/// if asked, and switch the client to it.
-pub fn open_window(client: Option<&str>, w: &NewWindow) -> Result<()> {
-    let name = unique_session(&session_name(w.name));
-    let cwd = w.cwd.display().to_string();
-    let created = tmux_out(&[
-        "new-session", "-d", "-P", "-F", "#{session_id} #{window_id} #{pane_id}",
-        "-s", &name, "-n", w.name, "-c", &cwd,
-    ])
-    .context("tmux new-session failed")?;
-    let mut f = created.split(' ');
-    let (sess, win, pane) = (f.next().unwrap_or(""), f.next().unwrap_or(""), f.next().unwrap_or(""));
-    if pane.is_empty() {
-        bail!("unexpected tmux output");
-    }
-
-    // Titles come from our own tags; don't let tmux rename the window to the cwd.
-    crate::tmux::run(&["set-option", "-w", "-t", win, "automatic-rename", "off"]);
-    crate::tmux::run(&["rename-window", "-t", win, w.name]);
-    // Session options: the `#{@hud_*}` formats resolve them for the session's panes.
-    for (k, v) in [("@hud_kind", Some(w.kind)), ("@hud_repo", w.repo), ("@hud_topic", w.topic), ("@hud_path", Some(cwd.as_str()))] {
-        if let Some(v) = v {
-            crate::tmux::run(&["set-option", "-t", sess, k, v]);
-        }
-    }
-    if w.launch {
-        crate::tmux::run(&["send-keys", "-t", pane, &config::claude_cmd(), "Enter"]);
-    }
-    focus(client, sess, win);
-    Ok(())
-}
-
-fn focus(client: Option<&str>, session: &str, window_id: &str) {
-    match client {
-        Some(c) => crate::tmux::run(&["switch-client", "-c", c, "-t", session]),
-        None => crate::tmux::run(&["switch-client", "-t", session]),
-    };
-    crate::tmux::run(&["select-window", "-t", window_id]);
-}
-
-/// Session tagged (at session level) for this worktree path, if any.
-/// `#{@hud_path}` in a format would also match a legacy window-level tag via the
-/// session's active window, so read the session's own option instead.
-fn find_session(path: &Path) -> Option<String> {
-    let want = path.display().to_string();
-    tmux_out(&["list-sessions", "-F", "#{session_id}"])?.lines().find_map(|id| {
-        let p = tmux_out(&["show-options", "-qv", "-t", id, "@hud_path"])?;
-        (p == want).then(|| id.to_string())
-    })
-}
-
-/// The tagged session for this worktree path and its first window id.
-fn find_window(path: &Path) -> Option<(String, String)> {
-    let sess = find_session(path)?;
-    let win = tmux_out(&["list-windows", "-t", &sess, "-F", "#{window_id}"])?.lines().next()?.to_string();
-    Some((sess, win))
-}
-
 pub fn window_name(repo: &str, wt: &Worktree) -> String {
     format!("{repo}/{}", wt.branch.as_deref().unwrap_or("detached"))
 }
 
 /// Open (or switch to the existing session for) a worktree, as a plain shell.
 pub fn open_worktree(client: Option<&str>, repo: &Repo, wt: &Worktree) -> Result<()> {
-    if let Some((s, w)) = find_window(&wt.path) {
-        focus(client, &s, &w);
+    if mux::get().focus_worktree(client, &wt.path) {
         return Ok(());
     }
-    open_window(client, &NewWindow {
+    mux::get().open_window(client, &NewWindow {
         name: &window_name(&repo.name, wt),
         cwd: &wt.path,
         kind: "worktree",
@@ -143,7 +54,7 @@ pub fn new_worktree(client: Option<&str>, repo: &Repo, branch: &str, launch: boo
         git(&repo.path, &["worktree", "add", "-b", branch, &dirs])?;
     }
     let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
-    open_window(client, &NewWindow {
+    mux::get().open_window(client, &NewWindow {
         name: &format!("{}/{branch}", repo.name),
         cwd: &dir,
         kind: "worktree",
@@ -154,7 +65,7 @@ pub fn new_worktree(client: Option<&str>, repo: &Repo, branch: &str, launch: boo
     Ok(format!("worktree {} on {branch}", dir.display()))
 }
 
-/// Remove a linked worktree and close its tmux session. The branch is kept.
+/// Remove a linked worktree and close its session. The branch is kept.
 /// Checks go first (git refuses dirty or locked worktrees; then nothing is closed or moved).
 /// The checkout is then renamed out of the way and git's record of it pruned, so the path
 /// is free at once; deleting the files (`target/`, `node_modules/`…) is left to a detached
@@ -174,9 +85,7 @@ pub fn remove_worktree(repo: &Repo, wt: &Worktree, force: bool) -> Result<String
     let name = wt.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let trash = wt.path.with_file_name(format!(".trash-{name}-{stamp}"));
-    if let Some(sess) = find_session(&wt.path) {
-        crate::tmux::run(&["kill-session", "-t", &sess]);
-    }
+    mux::get().kill_worktree(&wt.path);
     std::fs::rename(&wt.path, &trash).with_context(|| format!("moving {} aside", wt.path.display()))?;
     let pruned = git(&repo.path, &["worktree", "prune"]);
     purge(&trash);
@@ -202,9 +111,9 @@ fn purge(dir: &Path) {
     }
 }
 
-/// Kill a chat's tmux session (and the agent in it).
+/// Kill a chat's session (and the agent in it).
 pub fn kill_chat(session: &str) -> Result<String> {
-    if !crate::tmux::run(&["kill-session", "-t", &format!("={session}")]) {
+    if !mux::get().kill_session(session) {
         bail!("couldn't kill session {session}");
     }
     Ok(format!("killed {session}"))
@@ -215,7 +124,7 @@ pub fn new_chat(client: Option<&str>, topic: &str, cwd: &Path) -> Result<String>
     if topic.is_empty() {
         bail!("chat needs a topic");
     }
-    open_window(client, &NewWindow {
+    mux::get().open_window(client, &NewWindow {
         name: &format!("chat:{topic}"),
         cwd,
         kind: "chat",

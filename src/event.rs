@@ -62,8 +62,8 @@ pub fn run(hook: &str) {
 }
 
 fn handle(hook: &str) -> Result<()> {
-    let Ok(pane) = std::env::var("TMUX_PANE") else {
-        return Ok(()); // not running under tmux
+    let Some(pane) = crate::mux::get().current_pane() else {
+        return Ok(()); // not running under a multiplexer
     };
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;

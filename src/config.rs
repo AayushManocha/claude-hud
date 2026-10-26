@@ -1,15 +1,7 @@
 use std::path::PathBuf;
-use std::process::Command;
-
-/// A tmux global option (`set -g @claude-hud-…`), if the server is reachable and it's set.
-pub fn tmux_opt(name: &str) -> Option<String> {
-    let out = Command::new("tmux").args(["show-option", "-gqv", name]).output().ok()?;
-    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (out.status.success() && !v.is_empty()).then_some(v)
-}
 
 fn setting(env: &str, opt: &str) -> Option<String> {
-    std::env::var(env).ok().filter(|v| !v.is_empty()).or_else(|| tmux_opt(opt))
+    std::env::var(env).ok().filter(|v| !v.is_empty()).or_else(|| crate::mux::get().option(opt))
 }
 
 fn expand(p: &str) -> PathBuf {
@@ -34,7 +26,7 @@ pub fn notify_mode() -> String {
     setting("CC_HUD_NOTIFY", "@claude-hud-notify").unwrap_or_else(|| "tmux".into())
 }
 
-/// Repo names pinned in tmux config (`@claude-hud-projects`, comma-separated).
+/// Repo names pinned in the multiplexer config (`@claude-hud-projects`, comma-separated).
 pub fn config_pins() -> Vec<String> {
     setting("CC_HUD_PROJECTS", "@claude-hud-projects")
         .map(|v| v.split(',').map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).collect())

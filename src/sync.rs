@@ -1,5 +1,5 @@
 use crate::state::{self, AgentState, Status};
-use crate::tmux;
+use crate::mux::{self, PaneInfo};
 use std::collections::HashMap;
 
 /// needs_input > working > idle, so a window shows its most urgent agent.
@@ -12,7 +12,7 @@ fn rank(s: Status) -> u8 {
 }
 
 /// Agents whose pane is still alive; prunes records for dead panes.
-pub fn live_agents(live: &HashMap<String, tmux::PaneInfo>) -> Vec<AgentState> {
+pub fn live_agents(live: &HashMap<String, PaneInfo>) -> Vec<AgentState> {
     state::load_all()
         .into_iter()
         .filter(|a| {
@@ -25,10 +25,9 @@ pub fn live_agents(live: &HashMap<String, tmux::PaneInfo>) -> Vec<AgentState> {
         .collect()
 }
 
-/// Mirror agent status onto per-window `@hud_glyph` options so
-/// `window-status-format` can show it, then redraw the status line.
+/// Mirror agent status onto per-window glyphs (where the multiplexer supports them).
 pub fn run() {
-    let Some(live) = tmux::live_panes() else { return };
+    let Some(live) = mux::get().live_panes() else { return };
     let agents = live_agents(&live);
 
     let mut worst: HashMap<&str, Status> = HashMap::new();
@@ -44,18 +43,7 @@ pub fn run() {
     windows.sort_unstable();
     windows.dedup();
 
-    let mut args: Vec<&str> = vec![];
-    for w in windows {
-        if !args.is_empty() {
-            args.push(";");
-        }
-        match worst.get(w) {
-            Some(s) => args.extend(["set-option", "-w", "-t", w, "@hud_glyph", s.glyph()]),
-            None => args.extend(["set-option", "-wu", "-t", w, "@hud_glyph"]),
-        }
-    }
-    if !args.is_empty() {
-        tmux::run(&args);
-    }
-    tmux::run(&["refresh-client", "-S"]);
+    let glyphs: Vec<(String, Option<&'static str>)> =
+        windows.into_iter().map(|w| (w.to_string(), worst.get(w).map(|s| s.glyph()))).collect();
+    mux::get().set_window_glyphs(&glyphs);
 }

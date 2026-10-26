@@ -9,19 +9,19 @@ mod interact;
 mod lifecycle;
 mod list;
 mod model;
+mod mux;
 mod next;
 mod notify;
 mod status;
 mod sync;
 mod state;
-mod tmux;
 mod transcript;
 mod usage;
 
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "cc-hud", about = "tmux HUD for Claude Code agents")]
+#[command(name = "cc-hud", about = "tmux/zellij HUD for Claude Code agents")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -153,13 +153,8 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Open => {
-            use std::os::unix::process::CommandExt;
             let session = std::env::var("CC_HUD_SESSION").unwrap_or_else(|_| "dev".into());
-            let err = std::process::Command::new("tmux")
-                .args(["new-session", "-A", "-s", &session, "-c"])
-                .arg(config::root())
-                .exec();
-            Err(err.into())
+            Err(mux::get().attach_workspace(&session, &config::root()).into())
         }
         Cmd::Sync => {
             sync::run();

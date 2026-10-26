@@ -1,6 +1,6 @@
 use crate::discover::Repo;
 use crate::state::{AgentState, Status};
-use crate::tmux::PaneInfo;
+use crate::mux::PaneInfo;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
