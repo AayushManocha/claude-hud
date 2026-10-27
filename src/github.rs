@@ -8,7 +8,7 @@ use std::process::Command;
 const MERGED_KEEP: u64 = 24 * 3600;
 
 const QUERY: &str = "query($q:String!){search(query:$q,type:ISSUE,first:30){nodes{... on PullRequest{\
-number title url isDraft state mergedAt \
+number title body url isDraft state mergedAt \
 commits(last:1){nodes{commit{statusCheckRollup{state}}}} \
 reviews(first:50){nodes{body author{login __typename}}} \
 comments(first:50){nodes{author{login __typename}}} \
@@ -29,6 +29,7 @@ pub struct Pr {
     pub number: u64,
     pub title: String,
     pub url: String,
+    pub body: String,
     pub draft: bool,
     pub ci: Ci,
     /// Comments from people other than the author: no bots, and nothing the user's own agents wrote.
@@ -123,6 +124,7 @@ fn fetch_repo(name: &str, path: &Path, me: &str, now: u64) -> Result<Vec<Pr>, St
                 number: p["number"].as_u64()?,
                 title: p["title"].as_str()?.to_string(),
                 url: p["url"].as_str()?.to_string(),
+                body: p["body"].as_str().unwrap_or("").replace('\r', ""),
                 draft: p["isDraft"].as_bool().unwrap_or(false),
                 ci: if merged.is_some() { Ci::None } else { ci_of(p) },
                 human_comments: human_comments(p, me),

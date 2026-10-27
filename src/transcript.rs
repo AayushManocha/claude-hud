@@ -91,7 +91,7 @@ impl Transcript {
 }
 
 /// Hard-wrap on width, preferring to break at a space.
-fn wrap(text: &str, width: usize) -> Vec<String> {
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out = vec![];
     let chars: Vec<char> = text.chars().collect();

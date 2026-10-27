@@ -124,6 +124,8 @@ struct App {
     pr_focus: bool,
     pr_state: ListState,
     pr_area: Rect,
+    /// Lines the selected PR's description is scrolled down in the peek.
+    pr_scroll: u16,
     quit: bool,
     /// A dashboard that stays running (a Rex tab): leaving it goes back instead of exiting,
     /// and it only polls while shown.
@@ -403,6 +405,7 @@ impl App {
             pr_focus: false,
             pr_state: ListState::default(),
             pr_area: Rect::default(),
+            pr_scroll: 0,
             quit: false,
             persistent,
             visible,
@@ -609,6 +612,7 @@ impl App {
         if n > 0 {
             let cur = self.pr_state.selected().unwrap_or(0) as isize;
             self.pr_state.select(Some((cur + d).clamp(0, n - 1) as usize));
+            self.pr_scroll = 0;
         }
     }
 
@@ -627,6 +631,8 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => self.step_pr(isize::MIN / 2),
             KeyCode::Char('G') | KeyCode::End => self.step_pr(isize::MAX / 2),
             KeyCode::Enter | KeyCode::Char(' ') => self.open_selected_pr(),
+            KeyCode::PageDown | KeyCode::Char('J') => self.pr_scroll = self.pr_scroll.saturating_add(5),
+            KeyCode::PageUp | KeyCode::Char('K') => self.pr_scroll = self.pr_scroll.saturating_sub(5),
             KeyCode::Esc | KeyCode::Char('f') | KeyCode::Tab => self.pr_focus = false,
             KeyCode::Char('q') => self.leave(true),
             _ => {}
@@ -1040,6 +1046,10 @@ impl App {
             let a = self.peek_area;
             x >= a.x && x < a.x + a.width && y >= a.y && y < a.y + a.height
         };
+        if in_peek && self.pr_focus && matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+            self.pr_scroll = if up { self.pr_scroll.saturating_sub(PEEK_SCROLL_STEP as u16) } else { self.pr_scroll.saturating_add(PEEK_SCROLL_STEP as u16) };
+            return;
+        }
         if in_peek && matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
             let was = self.peek_scroll;
             self.peek_scroll = if up { was + PEEK_SCROLL_STEP } else { was.saturating_sub(PEEK_SCROLL_STEP) };
@@ -1079,6 +1089,9 @@ impl App {
                     let i = self.pr_state.offset() + (y - pa.y) as usize;
                     if i < self.prs.len() {
                         self.pr_focus = true;
+                        if self.pr_state.selected() != Some(i) {
+                            self.pr_scroll = 0;
+                        }
                         self.pr_state.select(Some(i));
                         let double = self.last_click.take().is_some_and(|(j, t)| j == usize::MAX - i && t.elapsed() < Duration::from_millis(400));
                         if double {
@@ -1327,7 +1340,9 @@ impl App {
             self.render_prs(f, pr_body);
         }
 
-        if self.peek && !self.grid {
+        if self.peek && !self.grid && self.pr_focus && self.pr_state.selected().is_some_and(|i| i < self.prs.len()) {
+            self.render_pr_detail(f, peek);
+        } else if self.peek && !self.grid {
             let title = match self.selected_entry() {
                 Some(e) => Line::from(vec![
                     Span::styled(format!(" {} ", e.a.status.glyph()), status_style(e.a.status)),
@@ -1374,6 +1389,38 @@ impl App {
 
         self.render_footer(f, foot);
         self.render_picker(f);
+    }
+
+    /// The selected PR's title and description, in place of the agent peek.
+    fn render_pr_detail(&mut self, f: &mut Frame, area: Rect) {
+        let Some(p) = self.pr_state.selected().and_then(|i| self.prs.get(i)) else { return };
+        self.peek_area = area;
+        let (state, state_style) = match (p.merged, p.ci) {
+            (Some(_), _) => ("merged".to_string(), Style::new().fg(ACCENT)),
+            (None, Ci::Running) => ("CI running".to_string(), Style::new().fg(YELLOW)),
+            (None, Ci::Failed) => ("CI failed".to_string(), Style::new().fg(RED)),
+            (None, Ci::Passed) => ("CI passed".to_string(), Style::new().fg(GREEN)),
+            (None, Ci::None) => ("no CI".to_string(), Style::new().fg(FAINT)),
+        };
+        let mut meta = vec![Span::styled(format!("{}#{}  ", p.repo, p.number), Style::new().fg(FAINT)), Span::styled(state, state_style)];
+        if p.draft {
+            meta.push(Span::styled("  draft", dim()));
+        }
+        if p.human_comments > 0 {
+            meta.push(Span::styled(format!("  💬 {} from reviewers", p.human_comments), Style::new().fg(YELLOW)));
+        }
+        let body = if p.body.trim().is_empty() { "(no description)".to_string() } else { p.body.clone() };
+        let block = panel().title(Span::styled(" pull request ", Style::new().fg(ACCENT)));
+        let inner = block.inner(area);
+        let w = inner.width as usize;
+        let body_style = if p.body.trim().is_empty() { Style::new().fg(FAINT) } else { Style::new().fg(TEXT) };
+        let mut lines: Vec<Line> = transcript::wrap(&p.title, w).into_iter().map(|l| Line::styled(l, Style::new().fg(TEXT).add_modifier(Modifier::BOLD))).collect();
+        lines.push(Line::from(meta));
+        lines.push(Line::raw(""));
+        lines.extend(body.lines().flat_map(|l| transcript::wrap(l, w)).map(|l| Line::styled(l, body_style)));
+        // Don't scroll past the end.
+        self.pr_scroll = self.pr_scroll.min(lines.len().saturating_sub(inner.height as usize) as u16);
+        f.render_widget(Paragraph::new(lines).scroll((self.pr_scroll, 0)).block(block), area);
     }
 
     fn render_prs(&mut self, f: &mut Frame, area: Rect) {
