@@ -80,8 +80,21 @@ fn ci_of(pr: &Value) -> Ci {
     }
 }
 
+/// The `gh` to run. A tmux popup or Rex tab may not have Homebrew on its PATH, so look in the
+/// usual places before falling back to PATH (`CC_HUD_GH` overrides).
+fn gh_bin() -> String {
+    if let Some(p) = std::env::var("CC_HUD_GH").ok().filter(|p| !p.is_empty()) {
+        return p;
+    }
+    ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]
+        .into_iter()
+        .find(|p| Path::new(p).is_file())
+        .unwrap_or("gh")
+        .to_string()
+}
+
 fn gh(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("gh").current_dir(cwd).args(args).output().map_err(|e| format!("gh: {e}"))?;
+    let out = Command::new(gh_bin()).current_dir(cwd).args(args).output().map_err(|e| format!("gh ({}): {e}; set CC_HUD_GH to its path", gh_bin()))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(err.lines().next().unwrap_or("gh failed").to_string());
