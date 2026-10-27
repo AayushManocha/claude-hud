@@ -1,4 +1,5 @@
 use crate::discover::{self, Repo};
+use crate::github::{self, Ci, Pr};
 use crate::interact::{self, Decision};
 use crate::model::{self, Entry, Key, Kind, Row};
 use crate::state::{self, Status};
@@ -19,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// What the footer input line is collecting.
@@ -113,6 +114,16 @@ struct App {
     picker_state: ListState,
     /// Row and time of the last click, to recognise a double-click.
     last_click: Option<(usize, Instant)>,
+    /// The user's PRs in the pinned repos, refreshed in the background.
+    prs: Vec<Pr>,
+    pr_err: Option<String>,
+    pr_rx: Receiver<Result<Vec<Pr>, String>>,
+    /// Pinned repos (name, checkout) the PR thread fetches for.
+    pr_targets: Arc<Mutex<Vec<(String, PathBuf)>>>,
+    /// Keys go to the PR list instead of the agents.
+    pr_focus: bool,
+    pr_state: ListState,
+    pr_area: Rect,
     quit: bool,
     /// A dashboard that stays running (a Rex tab): leaving it goes back instead of exiting,
     /// and it only polls while shown.
@@ -316,6 +327,28 @@ impl App {
                 }
             }
         });
+        // PRs come from `gh` over the network, so they get their own thread and a slower pace.
+        let (pr_tx, pr_rx) = mpsc::channel();
+        let (pr_wake, pr_wake_rx) = mpsc::channel::<()>();
+        let pr_targets: Arc<Mutex<Vec<(String, PathBuf)>>> = Arc::default();
+        let (vis, targets) = (visible.clone(), pr_targets.clone());
+        std::thread::spawn(move || {
+            const EVERY: Duration = Duration::from_secs(60);
+            let mut last: Option<(Instant, Vec<(String, PathBuf)>)> = None;
+            loop {
+                let now_targets = targets.lock().map(|t| t.clone()).unwrap_or_default();
+                let due = last.as_ref().is_none_or(|(t, old)| t.elapsed() >= EVERY || *old != now_targets);
+                if due && vis.load(Ordering::Relaxed) && !now_targets.is_empty() {
+                    if pr_tx.send(github::fetch(&now_targets, state::now())).is_err() {
+                        break;
+                    }
+                    last = Some((Instant::now(), now_targets));
+                }
+                if let Err(RecvTimeoutError::Disconnected) = pr_wake_rx.recv_timeout(Duration::from_millis(500)) {
+                    break;
+                }
+            }
+        });
         let (removal_tx, removal_rx) = mpsc::channel();
         let mut a = App {
             live,
@@ -363,10 +396,17 @@ impl App {
             picker_list: Rect::default(),
             picker_state: ListState::default(),
             last_click: None,
+            prs: vec![],
+            pr_err: None,
+            pr_rx,
+            pr_targets,
+            pr_focus: false,
+            pr_state: ListState::default(),
+            pr_area: Rect::default(),
             quit: false,
             persistent,
             visible,
-            wake: vec![live_wake, scan_wake],
+            wake: vec![live_wake, scan_wake, pr_wake],
         };
         a.pinned = a.all_pins();
         // Start on the agent the user was just working in; refresh keeps `sel` if that row exists.
@@ -508,6 +548,7 @@ impl App {
             let listed: HashSet<&PathBuf> = self.repos.iter().flat_map(|r| &r.worktrees).map(|w| &w.path).collect();
             self.removing.retain(|p, done| !*done || listed.contains(p));
         }
+        self.sync_prs();
         for r in &mut self.repos {
             r.worktrees.retain(|w| !self.removing.contains_key(&w.path));
         }
@@ -528,6 +569,68 @@ impl App {
             .filter(|_| !self.rows.is_empty());
         self.select(idx);
         self.refresh_peek();
+    }
+
+    /// Point the PR thread at the pinned repos and take what it fetched.
+    fn sync_prs(&mut self) {
+        let targets: Vec<(String, PathBuf)> = self
+            .pinned
+            .iter()
+            .filter_map(|n| self.repos.iter().find(|r| &r.name == n))
+            .map(|r| (r.name.clone(), r.path.clone()))
+            .collect();
+        if let Ok(mut t) = self.pr_targets.lock() {
+            if *t != targets {
+                *t = targets.clone();
+            }
+        }
+        while let Ok(r) = self.pr_rx.try_recv() {
+            match r {
+                Ok(v) => {
+                    self.prs = v;
+                    self.pr_err = None;
+                }
+                Err(e) => self.pr_err = Some(e),
+            }
+        }
+        // Merged PRs age out between fetches too.
+        let now = state::now();
+        self.prs.retain(|p| p.merged.is_none_or(|t| now.saturating_sub(t) < 24 * 3600));
+        self.prs.retain(|p| targets.iter().any(|(n, _)| *n == p.repo));
+        if targets.is_empty() {
+            self.pr_focus = false;
+        }
+        let sel = self.pr_state.selected().unwrap_or(0).min(self.prs.len().saturating_sub(1));
+        self.pr_state.select(Some(sel).filter(|_| !self.prs.is_empty()));
+    }
+
+    fn step_pr(&mut self, d: isize) {
+        let n = self.prs.len() as isize;
+        if n > 0 {
+            let cur = self.pr_state.selected().unwrap_or(0) as isize;
+            self.pr_state.select(Some((cur + d).clamp(0, n - 1) as usize));
+        }
+    }
+
+    fn open_selected_pr(&mut self) {
+        let Some(url) = self.pr_state.selected().and_then(|i| self.prs.get(i)).map(|p| p.url.clone()) else { return };
+        match github::open_url(&url) {
+            Ok(()) => self.say(Ok(format!("opened {url}"))),
+            Err(e) => self.say(Err(e)),
+        }
+    }
+
+    fn on_pr_key(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Char('j') | KeyCode::Down => self.step_pr(1),
+            KeyCode::Char('k') | KeyCode::Up => self.step_pr(-1),
+            KeyCode::Char('g') | KeyCode::Home => self.step_pr(isize::MIN / 2),
+            KeyCode::Char('G') | KeyCode::End => self.step_pr(isize::MAX / 2),
+            KeyCode::Enter | KeyCode::Char(' ') => self.open_selected_pr(),
+            KeyCode::Esc | KeyCode::Char('f') | KeyCode::Tab => self.pr_focus = false,
+            KeyCode::Char('q') => self.leave(true),
+            _ => {}
+        }
     }
 
     fn select(&mut self, idx: Option<usize>) {
@@ -968,6 +1071,27 @@ impl App {
             }
             return;
         }
+        let pa = self.pr_area;
+        if !self.grid && pa.height > 0 && x >= pa.x && x < pa.x + pa.width && y >= pa.y && y < pa.y + pa.height {
+            match m.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => self.step_pr(if up { -1 } else { 1 }),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let i = self.pr_state.offset() + (y - pa.y) as usize;
+                    if i < self.prs.len() {
+                        self.pr_focus = true;
+                        self.pr_state.select(Some(i));
+                        let double = self.last_click.take().is_some_and(|(j, t)| j == usize::MAX - i && t.elapsed() < Duration::from_millis(400));
+                        if double {
+                            self.open_selected_pr();
+                        } else {
+                            self.last_click = Some((usize::MAX - i, Instant::now()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match m.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let d = if up { -1 } else { 1 };
@@ -984,6 +1108,7 @@ impl App {
                     self.list_row_at(x, y)
                 };
                 let Some(idx) = idx else { return };
+                self.pr_focus = false;
                 let double = self.last_click.take().is_some_and(|(i, t)| i == idx && t.elapsed() < Duration::from_millis(400));
                 self.select(Some(idx));
                 self.refresh_peek();
@@ -1047,8 +1172,12 @@ impl App {
             self.refresh();
             return;
         }
+        if self.pr_focus {
+            return self.on_pr_key(k);
+        }
         match k.code {
             KeyCode::Char('q') => self.leave(true),
+            KeyCode::Char('f') if !self.pinned.is_empty() => self.pr_focus = true,
             KeyCode::Esc if self.filter.is_empty() => self.leave(true),
             KeyCode::Esc => {
                 self.filter.clear();
@@ -1094,7 +1223,14 @@ impl App {
             Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1), Constraint::Length(pad)])
                 .areas(f.area());
         let peek_w = if self.peek && !self.grid { main.width * 11 / 20 } else { 0 };
-        let [body, peek] = Layout::horizontal([Constraint::Min(20), Constraint::Length(peek_w)]).areas(main);
+        let [left, peek] = Layout::horizontal([Constraint::Min(20), Constraint::Length(peek_w)]).areas(main);
+        // Pinned repos get a PR panel under the agents, sized to its contents.
+        let pr_h = if self.pinned.is_empty() || self.grid {
+            0
+        } else {
+            (self.prs.len().max(1) as u16 + 2).min(10).min(left.height.saturating_sub(5))
+        };
+        let [body, pr_body] = Layout::vertical([Constraint::Min(3), Constraint::Length(pr_h)]).areas(left);
 
         let count = |s| self.entries.iter().filter(|e| e.a.status == s).count();
         let mut title = vec![Span::styled(" ◆ cc-hud ", Style::new().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD))];
@@ -1110,6 +1246,7 @@ impl App {
         f.render_widget(Line::from(self.usage_spans(head_r.width as usize)).right_aligned(), head_r);
 
         self.list_area = Rect::default();
+        self.pr_area = Rect::default();
         self.peek_area = Rect::default();
         self.grid_cells.clear();
         if self.grid {
@@ -1186,6 +1323,10 @@ impl App {
             );
         }
 
+        if pr_h > 0 {
+            self.render_prs(f, pr_body);
+        }
+
         if self.peek && !self.grid {
             let title = match self.selected_entry() {
                 Some(e) => Line::from(vec![
@@ -1233,6 +1374,76 @@ impl App {
 
         self.render_footer(f, foot);
         self.render_picker(f);
+    }
+
+    fn render_prs(&mut self, f: &mut Frame, area: Rect) {
+        let now = state::now();
+        let mut block = panel().title(Span::styled(" pull requests ", if self.pr_focus { Style::new().fg(ACCENT) } else { Style::new().fg(DIM) }));
+        if self.pr_focus {
+            block = block.border_style(Style::new().fg(ACCENT)).title_bottom(Line::styled(" ⏎ open in browser · f/esc back ", dim()).right_aligned());
+        } else {
+            block = block.title_bottom(Line::styled(" f focus ", Style::new().fg(FAINT)).right_aligned());
+        }
+        let inner = block.inner(area);
+        self.pr_area = inner;
+        let width = inner.width as usize;
+        let items: Vec<ListItem> = self
+            .prs
+            .iter()
+            .map(|p| {
+                let (ci, ci_style) = match (p.merged, p.ci) {
+                    (Some(_), _) => ("merged", Style::new().fg(ACCENT)),
+                    (None, Ci::Running) => ("running", Style::new().fg(YELLOW)),
+                    (None, Ci::Failed) => ("failed", Style::new().fg(RED)),
+                    (None, Ci::Passed) => ("passed", Style::new().fg(GREEN)),
+                    (None, Ci::None) => ("no ci", Style::new().fg(FAINT)),
+                };
+                let glyph = match (p.merged, p.ci) {
+                    (Some(_), _) => "✔",
+                    (None, Ci::Running) => "●",
+                    (None, Ci::Failed) => "✗",
+                    (None, Ci::Passed) => "✓",
+                    (None, Ci::None) => "○",
+                };
+                let comments = if p.human_comments > 0 {
+                    Span::styled(format!(" 💬{}", p.human_comments), Style::new().fg(YELLOW))
+                } else {
+                    Span::raw("")
+                };
+                let tail = match p.merged {
+                    Some(t) => format!(" {} ago", age(now.saturating_sub(t))),
+                    None if p.draft => " draft".to_string(),
+                    None => String::new(),
+                };
+                let head = format!("{}#{} ", p.repo, p.number);
+                let used = 2 + 8 + head.chars().count() + tail.chars().count() + 4;
+                let title = fit(&p.title, width.saturating_sub(used).max(8));
+                let text = if p.merged.is_some() { dim() } else { Style::new().fg(TEXT) };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {glyph} "), ci_style),
+                    Span::styled(format!("{ci:<8}"), ci_style),
+                    Span::styled(head, Style::new().fg(FAINT)),
+                    Span::styled(title, text),
+                    Span::styled(tail, Style::new().fg(FAINT)),
+                    comments,
+                ]))
+            })
+            .collect();
+        f.render_widget(block, area);
+        if items.is_empty() {
+            let msg = match &self.pr_err {
+                Some(e) => Line::styled(format!(" ✗ {e}"), Style::new().fg(RED)),
+                None => Line::styled(" no open pull requests of yours in pinned repos", Style::new().fg(FAINT)),
+            };
+            f.render_widget(msg, inner);
+            return;
+        }
+        let hl = if self.pr_focus {
+            Style::new().bg(SURFACE).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        f.render_stateful_widget(List::new(items).highlight_style(hl), inner, &mut self.pr_state);
     }
 
     /// Plan limits for the header's right edge; empty if there's no room.
@@ -1314,7 +1525,7 @@ impl App {
             let leave = if self.persistent { "back" } else { "quit" };
             let keys = [
                 ("⏎", "jump"), ("a", "allow"), ("d", "deny"), ("r", "reply"), ("w", "worktree"), ("c", "chat"), ("x", "kill/remove"),
-                ("m", "grid"), ("/", "filter"), ("P", "pin"), ("p", "peek"), ("tab", "fold"), ("n", "next"),
+                ("m", "grid"), ("/", "filter"), ("P", "pin"), ("f", "PRs"), ("p", "peek"), ("tab", "fold"), ("n", "next"),
             ];
             let width = |k: &str, d: &str| k.chars().count() + 2 + d.chars().count() + 3;
             let room = (area.width as usize).saturating_sub(width("q", leave));

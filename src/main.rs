@@ -4,6 +4,7 @@ mod dashboard;
 mod discover;
 mod event;
 mod git;
+mod github;
 mod install;
 mod interact;
 mod lifecycle;
