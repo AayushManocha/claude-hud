@@ -117,6 +117,8 @@ struct App {
     /// The user's PRs in the pinned repos, refreshed in the background.
     prs: Vec<Pr>,
     pr_err: Option<String>,
+    /// Whether a fetch has finished for the current set of pinned repos.
+    pr_loaded: bool,
     pr_rx: Receiver<Result<Vec<Pr>, String>>,
     /// Pinned repos (name, checkout) the PR thread fetches for.
     pr_targets: Arc<Mutex<Vec<(String, PathBuf)>>>,
@@ -400,6 +402,7 @@ impl App {
             last_click: None,
             prs: vec![],
             pr_err: None,
+            pr_loaded: false,
             pr_rx,
             pr_targets,
             pr_focus: false,
@@ -585,9 +588,11 @@ impl App {
         if let Ok(mut t) = self.pr_targets.lock() {
             if *t != targets {
                 *t = targets.clone();
+                self.pr_loaded = false;
             }
         }
         while let Ok(r) = self.pr_rx.try_recv() {
+            self.pr_loaded = true;
             match r {
                 Ok(v) => {
                     self.prs = v;
@@ -601,6 +606,8 @@ impl App {
         self.prs.retain(|p| p.merged.is_none_or(|t| now.saturating_sub(t) < 24 * 3600));
         self.prs.retain(|p| targets.iter().any(|(n, _)| *n == p.repo));
         if targets.is_empty() {
+            // Nothing to fetch for: no pins, or pinned repos that aren't under the scanned root.
+            self.pr_loaded = !self.repos.is_empty();
             self.pr_focus = false;
         }
         let sel = self.pr_state.selected().unwrap_or(0).min(self.prs.len().saturating_sub(1));
@@ -1480,6 +1487,7 @@ impl App {
         if items.is_empty() {
             let msg = match &self.pr_err {
                 Some(e) => Line::styled(format!(" ✗ {e}"), Style::new().fg(RED)),
+                None if !self.pr_loaded => Line::styled(" loading pull requests…", Style::new().fg(DIM)),
                 None => Line::styled(" no open pull requests of yours in pinned repos", Style::new().fg(FAINT)),
             };
             f.render_widget(msg, inner);
