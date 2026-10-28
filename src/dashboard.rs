@@ -348,9 +348,12 @@ impl App {
             }
         });
         // PRs come from `gh` over the network, so they get their own thread and a slower pace.
+        // The last fetch is shown until then, and names the repos to fetch for before the
+        // first scan has found them.
+        let pr_cache = github::load_cache();
         let (pr_tx, pr_rx) = mpsc::channel();
         let (pr_wake, pr_wake_rx) = mpsc::channel::<()>();
-        let pr_targets: Arc<Mutex<Vec<(String, PathBuf)>>> = Arc::default();
+        let pr_targets = Arc::new(Mutex::new(pr_cache.as_ref().map(|c| c.targets.clone()).unwrap_or_default()));
         let (vis, targets) = (visible.clone(), pr_targets.clone());
         std::thread::spawn(move || {
             const EVERY: Duration = Duration::from_secs(60);
@@ -359,7 +362,11 @@ impl App {
                 let now_targets = targets.lock().map(|t| t.clone()).unwrap_or_default();
                 let due = last.as_ref().is_none_or(|(t, old)| t.elapsed() >= EVERY || *old != now_targets);
                 if due && vis.load(Ordering::Relaxed) && !now_targets.is_empty() {
-                    if pr_tx.send(github::fetch(&now_targets, state::now())).is_err() {
+                    let r = github::fetch(&now_targets, state::now());
+                    if let Ok(prs) = &r {
+                        github::save_cache(&now_targets, prs);
+                    }
+                    if pr_tx.send(r).is_err() {
                         break;
                     }
                     last = Some((Instant::now(), now_targets));
@@ -416,9 +423,9 @@ impl App {
             picker_list: Rect::default(),
             picker_state: ListState::default(),
             last_click: None,
-            prs: vec![],
+            pr_loaded: pr_cache.is_some(),
+            prs: pr_cache.map(|c| c.prs).unwrap_or_default(),
             pr_err: None,
-            pr_loaded: false,
             pr_rx,
             pr_targets,
             pr_focus: false,
@@ -595,12 +602,17 @@ impl App {
 
     /// Point the PR thread at the pinned repos and take what it fetched.
     fn sync_prs(&mut self) {
-        let targets: Vec<(String, PathBuf)> = self
-            .pinned
-            .iter()
-            .filter_map(|n| self.repos.iter().find(|r| &r.name == n))
-            .map(|r| (r.name.clone(), r.path.clone()))
-            .collect();
+        // Until the first scan, the targets are the cached ones the PR thread started with.
+        let scanned = !self.repos.is_empty();
+        let targets: Vec<(String, PathBuf)> = if scanned {
+            self.pinned
+                .iter()
+                .filter_map(|n| self.repos.iter().find(|r| &r.name == n))
+                .map(|r| (r.name.clone(), r.path.clone()))
+                .collect()
+        } else {
+            self.pr_targets.lock().map(|t| t.clone()).unwrap_or_default()
+        };
         if let Ok(mut t) = self.pr_targets.lock() {
             if *t != targets {
                 *t = targets.clone();
