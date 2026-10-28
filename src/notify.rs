@@ -17,6 +17,8 @@ pub fn needs_input(s: &AgentState) {
         (Some(r), None) => r.clone(),
         _ => s.cwd.rsplit('/').next().unwrap_or("agent").to_string(),
     };
+    let role = crate::state::role(&s.pane_id);
+    let who = if role.is_empty() { who } else { format!("{who} ({role})") };
     let what = s.message.as_deref().unwrap_or("needs input");
     let text = format!("⚠ {who}: {what}");
     // A backend with no message line of its own (Rex) falls back to a system notification.

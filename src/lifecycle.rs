@@ -43,8 +43,8 @@ fn unique_session(base: &str) -> String {
 }
 
 /// Create a tagged, detached session with one window, start `claude` in it
-/// if asked, and switch the client to it.
-pub fn open_window(client: Option<&str>, w: &NewWindow) -> Result<()> {
+/// if asked, and switch the client to it. Returns the window's pane id.
+pub fn open_window(client: Option<&str>, w: &NewWindow) -> Result<String> {
     match mux::active() {
         mux::Backend::Tmux => open_tmux_window(client, w),
         mux::Backend::Rex => {
@@ -55,13 +55,14 @@ pub fn open_window(client: Option<&str>, w: &NewWindow) -> Result<()> {
                 path: w.cwd.display().to_string(),
             };
             let launch = w.launch.then(config::claude_cmd);
-            let (sid, wid) = rex::open_window(w.name, w.cwd, &tags, launch.as_deref())?;
-            rex::focus(client, &sid, &wid).map_err(|e| anyhow::anyhow!("opened {}, but {e}", w.name))
+            let (sid, wid, pane) = rex::open_window(w.name, w.cwd, &tags, launch.as_deref())?;
+            rex::focus(client, &sid, &wid).map_err(|e| anyhow::anyhow!("opened {}, but {e}", w.name))?;
+            Ok(pane)
         }
     }
 }
 
-fn open_tmux_window(client: Option<&str>, w: &NewWindow) -> Result<()> {
+fn open_tmux_window(client: Option<&str>, w: &NewWindow) -> Result<String> {
     let name = unique_session(&session_name(w.name));
     let cwd = w.cwd.display().to_string();
     let created = tmux_out(&[
@@ -88,7 +89,7 @@ fn open_tmux_window(client: Option<&str>, w: &NewWindow) -> Result<()> {
         crate::tmux::run(&["send-keys", "-t", pane, &config::claude_cmd(), "Enter"]);
     }
     focus(client, sess, win);
-    Ok(())
+    Ok(pane.to_string())
 }
 
 fn focus(client: Option<&str>, session: &str, window_id: &str) {
@@ -147,7 +148,81 @@ pub fn open_worktree(client: Option<&str>, repo: &Repo, wt: &Worktree) -> Result
         repo: Some(&repo.name),
         topic: None,
         launch: false,
-    })
+    })?;
+    Ok(())
+}
+
+/// Where another agent goes: beside an agent's pane, or into a worktree (its session's
+/// window if it has one, else a new session).
+pub enum Spot<'a> {
+    Pane(&'a str, &'a crate::tmux::PaneInfo),
+    Worktree(&'a Repo, &'a Worktree),
+}
+
+/// Start another `claude` at `spot`, working in `cwd`, give it `role`, and show it.
+pub fn add_agent(client: Option<&str>, spot: Spot, cwd: &Path, role: &str) -> Result<String> {
+    let pane = match spot {
+        Spot::Pane(anchor, p) => {
+            let pane = split_terminal(Some(anchor), None, cwd)?;
+            launch_in(&pane);
+            mux::jump(client, p, &pane).map_err(anyhow::Error::msg)?;
+            pane
+        }
+        Spot::Worktree(repo, wt) => match find_any(&wt.path) {
+            Some((s, w)) => {
+                let pane = split_terminal(None, Some((&s, &w)), cwd)?;
+                launch_in(&pane);
+                if is_rex_session(&s) {
+                    rex::focus(client, &s, &w).map_err(anyhow::Error::msg)?;
+                } else {
+                    focus(client, &s, &w);
+                }
+                pane
+            }
+            None => open_window(client, &NewWindow {
+                name: &window_name(&repo.name, wt),
+                cwd: &wt.path,
+                kind: "worktree",
+                repo: Some(&repo.name),
+                topic: None,
+                launch: true,
+            })?,
+        },
+    };
+    crate::state::set_role(&pane, role)?;
+    let role = role.trim();
+    Ok(if role.is_empty() { format!("new agent in {}", cwd.display()) } else { format!("new {role} agent in {}", cwd.display()) })
+}
+
+/// Split a terminal off `anchor` (a pane id), else off `window` (a session and its window).
+fn split_terminal(anchor: Option<&str>, window: Option<(&str, &str)>, cwd: &Path) -> Result<String> {
+    if let Some((sid, bid)) = anchor.and_then(rex::split) {
+        return rex::split_terminal(sid, Some(bid), None, cwd);
+    }
+    if let Some((sid, wid)) = window.filter(|(s, _)| is_rex_session(s)) {
+        return rex::split_terminal(sid, None, Some(wid), cwd);
+    }
+    let target = anchor.or(window.map(|(_, w)| w)).context("nowhere to split")?;
+    let cwd_s = cwd.display().to_string();
+    let pane = tmux_out(&["split-window", "-t", target, "-c", &cwd_s, "-P", "-F", "#{pane_id}"]).context("tmux split-window failed")?;
+    // Agents get an equal share of the window, however many there are.
+    crate::tmux::run(&["select-layout", "-t", &pane, "tiled"]);
+    Ok(pane)
+}
+
+fn launch_in(pane: &str) {
+    mux::send_text(pane, &config::claude_cmd());
+    mux::send_enter(pane);
+}
+
+/// Close one agent's pane, leaving the rest of its window alone.
+pub fn kill_agent(pane: &str) -> Result<String> {
+    let closed = if rex::is_pane(pane) { rex::close_pane(pane) } else { crate::tmux::run(&["kill-pane", "-t", pane]) };
+    if !closed {
+        bail!("couldn't close pane {}", mux::short_id(pane));
+    }
+    crate::state::forget(pane);
+    Ok(format!("closed {}", mux::short_id(pane)))
 }
 
 /// `<repo parent>/<repo>-wt/<branch with / → ->`

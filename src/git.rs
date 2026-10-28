@@ -14,6 +14,11 @@ pub fn branch(cwd: &str) -> Option<String> {
     git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
 }
 
+/// Top directory of the worktree `cwd` is in.
+pub fn toplevel(cwd: &str) -> Option<String> {
+    git(cwd, &["rev-parse", "--show-toplevel"])
+}
+
 /// Repo name shared by a main checkout and all its worktrees: the parent
 /// directory of the common git dir (`<repo>/.git`).
 pub fn repo_name(cwd: &str) -> Option<String> {

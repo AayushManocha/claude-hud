@@ -313,8 +313,8 @@ pub fn kill_session(session: &str) -> bool {
     run(&["kill", session])
 }
 
-/// A new session with one tagged window; starts `launch` in it if given. Returns the session id and first window id.
-pub fn open_window(name: &str, cwd: &Path, tags: &Tags, launch: Option<&str>) -> Result<(String, String)> {
+/// A new session with one tagged window; starts `launch` in it if given. Returns the session id, first window id and its pane id.
+pub fn open_window(name: &str, cwd: &Path, tags: &Tags, launch: Option<&str>) -> Result<(String, String, String)> {
     let cwd_s = cwd.display().to_string();
     let created = json(&["new", name, "-c", &cwd_s, "--window", name, "--json"]).context("rex new failed")?;
     let sid = str_of(&created, "session_id").to_string();
@@ -325,12 +325,34 @@ pub fn open_window(name: &str, cwd: &Path, tags: &Tags, launch: Option<&str>) ->
         bail!("unexpected rex output");
     }
     write_tags(&sid, tags)?;
+    let pane = pane_id(&sid, &bid);
     if let Some(cmd) = launch {
-        let pane = pane_id(&sid, &bid);
         send_text(&pane, cmd);
         send_enter(&pane);
     }
-    Ok((sid, wid))
+    Ok((sid, wid, pane))
+}
+
+/// A new terminal beside `block` (else the focused block of `window`) in session `sid`. Returns its pane id.
+pub fn split_terminal(sid: &str, block: Option<&str>, window: Option<&str>, cwd: &Path) -> Result<String> {
+    let cwd_s = cwd.display().to_string();
+    let mut args = vec!["split", "-s", sid, "-c", &cwd_s, "--json"];
+    if let Some(b) = block {
+        args.extend(["-b", b]);
+    }
+    if let Some(w) = window {
+        args.extend(["-w", w]);
+    }
+    let created = json(&args).context("rex split failed")?;
+    let bid = created.pointer("/block_ids/0").and_then(Value::as_str).unwrap_or("");
+    if bid.is_empty() {
+        bail!("unexpected rex output");
+    }
+    Ok(pane_id(sid, bid))
+}
+
+pub fn close_pane(pane: &str) -> bool {
+    split(pane).is_some_and(|(s, b)| run(&["block", "close", "-s", s, b]))
 }
 
 pub fn focus(client: Option<&str>, sid: &str, wid: &str) -> Result<(), String> {

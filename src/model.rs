@@ -7,11 +7,15 @@ use std::path::{Path, PathBuf};
 pub struct Entry {
     pub a: AgentState,
     pub p: PaneInfo,
+    /// The pane's job ("tests", "review"), if the user gave it one.
+    pub role: String,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Key {
     Group(String),
+    /// A worktree or chat with more than one agent, by `unit_of`.
+    Unit(String),
     Agent(String),
     /// A discovered worktree with no agent, by path.
     Worktree(String),
@@ -19,8 +23,11 @@ pub enum Key {
 
 pub enum Kind {
     Group { label: String, collapsed: bool, counts: [usize; 3] },
-    /// `entry` indexes the entries slice; the label is shown once per window.
-    Agent { entry: usize, show_label: bool },
+    /// Header of a worktree or chat that has more than one agent. `members` index the
+    /// entries slice in handle order (#1 first); `shared` are files more than one of them edited.
+    Unit { label: String, members: Vec<usize>, collapsed: bool, shared: Vec<Touched> },
+    /// `entry` indexes the entries slice; `slot` is set for an agent under a `Unit` header.
+    Agent { entry: usize, slot: Option<Slot> },
     /// Discovered worktree nobody is running an agent in.
     Worktree { repo: usize, wt: usize },
 }
@@ -28,6 +35,23 @@ pub enum Kind {
 pub struct Row {
     pub key: Key,
     pub kind: Kind,
+}
+
+/// An agent's place under its `Unit` header.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Slot {
+    /// Its handle: #1 is the agent that started first in the worktree.
+    pub n: usize,
+    /// Last row under the header (drawn with `╰`).
+    pub last: bool,
+}
+
+/// A file edited by agents of one unit, shown relative to the worktree.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Touched {
+    pub file: String,
+    /// Handles of the agents that edited it.
+    pub by: Vec<usize>,
 }
 
 pub const CHATS: &str = "chats";
@@ -57,6 +81,55 @@ pub fn label(e: &Entry) -> String {
     } else {
         e.a.branch.clone().unwrap_or_else(|| e.p.window_name.clone())
     }
+}
+
+/// What agents share: a chat's session, else the worktree they work in. Records from before
+/// worktree roots were kept fall back to the window.
+pub fn unit_of(e: &Entry) -> String {
+    if e.p.is_chat() {
+        format!("chat:{}", e.p.session_key)
+    } else if let Some(root) = &e.a.root {
+        format!("wt:{root}")
+    } else {
+        format!("win:{}", e.p.window_id)
+    }
+}
+
+/// The agents of every unit, in handle order: whoever started first is #1.
+pub fn units(entries: &[Entry]) -> BTreeMap<String, Vec<usize>> {
+    let mut m: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        m.entry(unit_of(e)).or_default().push(i);
+    }
+    for v in m.values_mut() {
+        v.sort_by(|&a, &b| (entries[a].a.started, &entries[a].a.pane_id).cmp(&(entries[b].a.started, &entries[b].a.pane_id)));
+    }
+    m
+}
+
+/// "#2 tests", or "#2" with no role.
+pub fn handle(n: usize, role: &str) -> String {
+    if role.is_empty() { format!("#{n}") } else { format!("#{n} {role}") }
+}
+
+/// Files the unit's agents edited, those edited by more than one agent first, then by name.
+/// Paths are shown relative to the worktree when inside it.
+pub fn touched(entries: &[Entry], members: &[usize]) -> Vec<Touched> {
+    let mut by_file: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (h, &i) in members.iter().enumerate() {
+        let e = &entries[i];
+        let root = e.a.root.as_deref().unwrap_or(&e.a.cwd);
+        for f in &e.a.edits {
+            let shown = Path::new(f).strip_prefix(root).map(|p| p.display().to_string()).unwrap_or_else(|_| f.clone());
+            let by = by_file.entry(shown).or_default();
+            if !by.contains(&(h + 1)) {
+                by.push(h + 1);
+            }
+        }
+    }
+    let mut v: Vec<Touched> = by_file.into_iter().map(|(file, by)| Touched { file, by }).collect();
+    v.sort_by_key(|t| t.by.len() < 2);
+    v
 }
 
 fn urgency(s: Status) -> u8 {
@@ -104,7 +177,8 @@ struct Group {
 
 /// Rows for the dashboard. Repos appear only if they have an agent or are in
 /// `pinned`; pinned repos with no agents start folded. `toggled` flips a group's default fold state.
-/// Groups with a needs-input agent, and any active filter, force expansion.
+/// Groups with a needs-input agent, and any active filter, force expansion; the same goes for
+/// units (a worktree or chat with several agents), whose header rows `toggled` also folds.
 /// Order: most urgent first, agent-less repos next, chats last.
 pub fn build(entries: &[Entry], repos: &[Repo], pinned: &[String], toggled: &HashSet<String>, filter: &str) -> Vec<Row> {
     let mut groups: BTreeMap<String, Group> = BTreeMap::new();
@@ -114,6 +188,7 @@ pub fn build(entries: &[Entry], repos: &[Repo], pinned: &[String], toggled: &Has
         }
     }
     let agent_dirs: Vec<PathBuf> = entries.iter().map(|e| canon(&e.a.cwd)).collect();
+    let all_units = units(entries);
     let with_agents: HashSet<String> = entries.iter().map(group_of).collect();
     for (ri, r) in repos.iter().enumerate() {
         if !with_agents.contains(&r.name) && !pinned.contains(&r.name) {
@@ -151,24 +226,40 @@ pub fn build(entries: &[Entry], repos: &[Repo], pinned: &[String], toggled: &Has
         let mut idx = g.agents.clone();
         idx.sort_by_key(|&i| {
             let e = &entries[i];
-            (std::cmp::Reverse(urgency(e.a.status)), std::cmp::Reverse(e.a.updated), e.p.window_id.clone(), e.a.pane_id.clone())
+            (std::cmp::Reverse(urgency(e.a.status)), std::cmp::Reverse(e.a.updated), e.a.pane_id.clone())
         });
-        // Keep a window's agents adjacent, ordered by its most urgent agent.
-        let mut windows: Vec<&str> = vec![];
+        // A unit's agents stay together, placed by its most urgent agent.
+        let mut order: Vec<String> = vec![];
         for &i in &idx {
-            let w = entries[i].p.window_id.as_str();
-            if !windows.contains(&w) {
-                windows.push(w);
+            let u = unit_of(&entries[i]);
+            if !order.contains(&u) {
+                order.push(u);
             }
         }
-        let mut last_window: Option<&str> = None;
-        for w in windows {
-            for &i in idx.iter().filter(|&&i| entries[i].p.window_id == w) {
+        for u in order {
+            let members = &all_units[&u];
+            if members.len() < 2 {
+                let i = members[0];
+                rows.push(Row { key: Key::Agent(entries[i].a.pane_id.clone()), kind: Kind::Agent { entry: i, slot: None } });
+                continue;
+            }
+            let needs = members.iter().any(|&i| entries[i].a.status == Status::NeedsInput);
+            let collapsed = toggled.contains(&u) && !needs && filter.is_empty();
+            let shared = touched(entries, members).into_iter().filter(|t| t.by.len() > 1).collect();
+            rows.push(Row {
+                key: Key::Unit(u.clone()),
+                kind: Kind::Unit { label: label(&entries[members[0]]), members: members.clone(), collapsed, shared },
+            });
+            if collapsed {
+                continue;
+            }
+            let shown: Vec<(usize, usize)> =
+                members.iter().enumerate().filter(|(_, i)| g.agents.contains(i)).map(|(h, &i)| (h + 1, i)).collect();
+            for (k, &(n, i)) in shown.iter().enumerate() {
                 rows.push(Row {
                     key: Key::Agent(entries[i].a.pane_id.clone()),
-                    kind: Kind::Agent { entry: i, show_label: last_window != Some(w) },
+                    kind: Kind::Agent { entry: i, slot: Some(Slot { n, last: k + 1 == shown.len() }) },
                 });
-                last_window = Some(w);
             }
         }
         if let Some(ri) = g.repo {
@@ -201,12 +292,14 @@ mod tests {
                 pane_id: pane.into(), session_id: "s".into(), cwd: "/".into(),
                 repo: Some(repo.into()), branch: Some(branch.into()), status: st,
                 task: Some("t".into()), tool: None, message: None, since: 0, updated: 0,
+                root: None, started: 0, edits: vec![],
             },
             p: PaneInfo {
                 session: "dev".into(), session_key: "dev".into(), window_id: win.into(), window_name: branch.into(),
                 kind: if chat { "chat".into() } else { "".into() },
                 topic: String::new(),
             },
+            role: String::new(),
         }
     }
 
@@ -214,7 +307,9 @@ mod tests {
         rows.iter()
             .map(|r| match &r.kind {
                 Kind::Group { label, collapsed, .. } => format!("G:{label}{}", if *collapsed { "(folded)" } else { "" }),
-                Kind::Agent { entry, .. } => format!("A:{entry}"),
+                Kind::Unit { members, .. } => format!("U:{}", members.len()),
+                Kind::Agent { entry, slot: None } => format!("A:{entry}"),
+                Kind::Agent { entry, slot: Some(s) } => format!("A:{entry}#{}", s.n),
                 Kind::Worktree { wt, .. } => format!("W:{wt}"),
             })
             .collect()
@@ -260,15 +355,42 @@ mod tests {
     }
 
     #[test]
-    fn label_shown_once_per_window() {
-        let es = vec![
-            entry("%0", "@0", "a", "m", Status::Working, false),
-            entry("%1", "@0", "a", "m", Status::Working, false),
+    fn agents_sharing_a_worktree_get_a_header_and_handles() {
+        let mut es = vec![
+            entry("%0", "@0", "a", "m", Status::Idle, false),
+            entry("%1", "@0", "a", "m", Status::NeedsInput, false),
+            entry("%2", "@1", "a", "m", Status::Working, false),
+            entry("%3", "@2", "a", "other", Status::Working, false),
         ];
+        // %0 and %2 share a worktree from different windows; %1 started first, so it is #1.
+        for (e, (root, t)) in es.iter_mut().zip([("/w/m", 5), ("/w/m", 1), ("/w/m", 9), ("/w/o", 0)]) {
+            e.a.root = Some(root.into());
+            e.a.started = t;
+        }
         let rows = build(&es, &[], &[], &HashSet::new(), "");
-        let shown: Vec<bool> = rows.iter().filter_map(|r| match r.kind {
-            Kind::Agent { show_label, .. } => Some(show_label), _ => None }).collect();
-        assert_eq!(shown, [true, false]);
+        assert_eq!(labels(&rows), ["G:a", "U:3", "A:1#1", "A:0#2", "A:2#3", "A:3"]);
+        assert!(matches!(rows[4].kind, Kind::Agent { slot: Some(Slot { last: true, .. }), .. }));
+
+        // A unit with a waiting agent can't be folded; otherwise it folds to its header.
+        let fold: HashSet<String> = ["wt:/w/m".to_string()].into();
+        assert_eq!(labels(&build(&es, &[], &[], &fold, ""))[..3], ["G:a", "U:3", "A:1#1"]);
+        es[1].a.status = Status::Idle;
+        assert_eq!(labels(&build(&es, &[], &[], &fold, "")), ["G:a", "U:3", "A:3"]);
+    }
+
+    #[test]
+    fn touched_files_shared_first_relative_to_worktree() {
+        let mut es = vec![
+            entry("%0", "@0", "a", "m", Status::Idle, false),
+            entry("%1", "@0", "a", "m", Status::Idle, false),
+        ];
+        es[0].a.root = Some("/w".into());
+        es[0].a.edits = vec!["/w/b.rs".into(), "/w/a.rs".into()];
+        es[1].a.root = Some("/w".into());
+        es[1].a.edits = vec!["/w/a.rs".into(), "/elsewhere/c.rs".into()];
+        let t = touched(&es, &[0, 1]);
+        let flat: Vec<(&str, Vec<usize>)> = t.iter().map(|t| (t.file.as_str(), t.by.clone())).collect();
+        assert_eq!(flat, [("a.rs", vec![1, 2]), ("/elsewhere/c.rs", vec![2]), ("b.rs", vec![1])]);
     }
 
     fn repo(name: &str, paths: &[(&str, &str)]) -> Repo {

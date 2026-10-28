@@ -29,7 +29,7 @@ fn agents_in(live: &HashMap<String, tmux::PaneInfo>, prune: bool) -> Vec<AgentSt
         .filter(|a| {
             let alive = live.contains_key(&a.pane_id) || !mux::reachable(&a.pane_id);
             if !alive && prune {
-                state::remove(&a.pane_id);
+                state::forget(&a.pane_id);
             }
             alive
         })

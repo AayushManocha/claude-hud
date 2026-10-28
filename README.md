@@ -41,7 +41,11 @@ cc-hud also drives Rex terminals through the `rex` CLI. Hooks, the dashboard (li
 | `N` | jump to the agent that has waited longest for you |
 
 Dashboard: `enter`/`space` jump/open, `a` allow once, `d` deny, `r` reply, `w` new worktree, `x` remove worktree / kill chat (confirms, offers force if dirty; keeps the branch),
-`c` new chat, `P` pin repos (fuzzy picker), `m` list/grid, `/` filter, `tab` fold, `p` peek, `n` next waiting, `q` quit.
+`c` new chat, `+` add an agent beside the selected one (or in the selected worktree), `R` set the selected agent's role,
+`P` pin repos (fuzzy picker), `m` list/grid, `/` filter, `tab` fold, `p` peek, `n` next waiting, `q` quit.
+
+Several agents in one worktree (or chat) are shown under a header row with each agent's status, numbered `#1`, `#2`… in the order they started, with an optional role (`#2 tests`).
+The header marks files more than one of them has edited with `⚡`, and the peek lists the files each one edited. `⏎`/`a`/`d`/`r` on the header act on the agent that most needs you; `x` on an agent under it closes just that pane, while `x` on the header removes the worktree or chat as before. `+` splits a pane off the selected agent and starts `claude` in it.
 
 Mouse: click a row (or grid tile) to select it, double-click to jump, click a repo header to fold it, scroll wheel to move (over the preview, it scrolls back through the agent's output); in the pin picker, click to toggle.
 
