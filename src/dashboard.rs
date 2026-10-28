@@ -29,6 +29,18 @@ enum InputKind {
     /// New worktree in repo `repos[i]`.
     Worktree(usize),
     Chat(PathBuf),
+    /// Another agent, and what to call the place it goes in the prompt.
+    Agent(Spot, String),
+    /// Rename the role of the agent in this pane.
+    Role(String),
+}
+
+/// Where `+` puts another agent.
+enum Spot {
+    /// Beside this agent's pane.
+    Pane(String),
+    /// Into `repos[i].worktrees[j]`.
+    Worktree(usize, usize),
 }
 
 /// A destructive action waiting on a y/n answer.
@@ -38,6 +50,8 @@ enum Confirm {
     Worktree(String, PathBuf, String, bool),
     /// Kill a chat's tmux session: (session name, label).
     Chat(String, String),
+    /// Close one agent's pane among several in a worktree or chat: (pane id, label).
+    Agent(String, String),
 }
 
 /// Outcome of a background worktree removal.
@@ -148,6 +162,8 @@ const ACCENT: Color = Color::Rgb(131, 165, 152);
 const RED: Color = Color::Rgb(251, 73, 52);
 const YELLOW: Color = Color::Rgb(250, 189, 47);
 const GREEN: Color = Color::Rgb(184, 187, 38);
+const PURPLE: Color = Color::Rgb(211, 134, 155);
+const ORANGE: Color = Color::Rgb(254, 128, 25);
 
 fn status_color(s: Status) -> Color {
     match s {
@@ -542,7 +558,7 @@ impl App {
             Some(live) => sync::known_agents(live)
                 .into_iter()
                 // An agent of a multiplexer that wasn't reachable has a record but no pane to show.
-                .filter_map(|a| Some(Entry { p: live.get(&a.pane_id)?.clone(), a }))
+                .filter_map(|a| Some(Entry { p: live.get(&a.pane_id)?.clone(), role: state::role(&a.pane_id), a }))
                 .collect(),
             None => vec![],
         };
@@ -651,11 +667,29 @@ impl App {
         self.sel = idx.map(|i| self.rows[i].key.clone());
     }
 
+    /// The selected agent; on a unit header, the one that most needs attention.
     fn selected_entry(&self) -> Option<&Entry> {
-        match self.rows.get(self.list.selected()?)?.kind {
-            Kind::Agent { entry, .. } => Some(&self.entries[entry]),
+        match &self.rows.get(self.list.selected()?)?.kind {
+            Kind::Agent { entry, .. } => Some(&self.entries[*entry]),
+            Kind::Unit { members, .. } => members.iter().map(|&i| &self.entries[i]).max_by_key(|e| {
+                let rank = match e.a.status {
+                    Status::NeedsInput => 2,
+                    Status::Working => 1,
+                    Status::Idle => 0,
+                };
+                (rank, std::cmp::Reverse(e.a.since))
+            }),
             _ => None,
         }
+    }
+
+    /// The selected agent's handle within its worktree or chat, if it shares one: (handle, role).
+    fn selected_handle(&self) -> Option<(usize, String)> {
+        let e = self.selected_entry()?;
+        let units = model::units(&self.entries);
+        let members = units.get(&model::unit_of(e)).filter(|m| m.len() > 1)?;
+        let n = members.iter().position(|&i| self.entries[i].a.pane_id == e.a.pane_id)? + 1;
+        Some((n, e.role.clone()))
     }
 
     /// One step up/down the list, wrapping past either end.
@@ -807,6 +841,7 @@ impl App {
         let name = match &self.rows.get(self.list.selected()?)?.kind {
             Kind::Group { label, .. } => label.clone(),
             Kind::Agent { entry, .. } => model::group_of(&self.entries[*entry]),
+            Kind::Unit { members, .. } => model::group_of(&self.entries[members[0]]),
             Kind::Worktree { repo, .. } => return Some(*repo),
         };
         self.repos.iter().position(|r| r.name == name)
@@ -824,8 +859,8 @@ impl App {
     fn selected_worktree(&self) -> Option<(usize, usize)> {
         let (ri, dir) = match &self.rows.get(self.list.selected()?)?.kind {
             Kind::Worktree { repo, wt } => return Some((*repo, *wt)).filter(|&(r, w)| self.repos[r].worktrees[w].path != self.repos[r].path),
-            Kind::Agent { entry, .. } => {
-                let e = &self.entries[*entry];
+            Kind::Agent { .. } | Kind::Unit { .. } => {
+                let e = self.selected_entry()?;
                 if e.p.is_chat() {
                     return None;
                 }
@@ -843,6 +878,13 @@ impl App {
     }
 
     fn start_remove(&mut self) {
+        // One agent among several: close just its pane. The header removes the whole worktree or chat.
+        if let Some(Kind::Agent { entry, slot: Some(s) }) = self.list.selected().and_then(|i| self.rows.get(i)).map(|r| &r.kind) {
+            let e = &self.entries[*entry];
+            let label = format!("{} {}", model::label(e), model::handle(s.n, &e.role));
+            self.confirm = Some(Confirm::Agent(e.a.pane_id.clone(), label));
+            return;
+        }
         if let Some(e) = self.selected_entry().filter(|e| e.p.is_chat()) {
             self.confirm = Some(Confirm::Chat(e.p.session_key.clone(), model::label(e)));
             return;
@@ -860,6 +902,11 @@ impl App {
             Some(Confirm::Worktree(repo, path, _, force)) => (repo, path, force),
             Some(Confirm::Chat(session, _)) => {
                 let r = lifecycle::kill_chat(&session).map_err(|e| e.to_string());
+                self.say(r);
+                return self.refresh();
+            }
+            Some(Confirm::Agent(pane, _)) => {
+                let r = lifecycle::kill_agent(&pane).map_err(|e| e.to_string());
                 self.say(r);
                 return self.refresh();
             }
@@ -898,6 +945,31 @@ impl App {
         }
     }
 
+    /// `+`: another agent beside the selected one, or in the selected worktree.
+    fn start_agent(&mut self) {
+        if let Some(Kind::Worktree { repo, wt }) = self.list.selected().and_then(|i| self.rows.get(i)).map(|r| &r.kind) {
+            let r = &self.repos[*repo];
+            let label = lifecycle::window_name(&r.name, &r.worktrees[*wt]);
+            self.input = Some((InputKind::Agent(Spot::Worktree(*repo, *wt), label), String::new()));
+            return;
+        }
+        match self.selected_entry() {
+            Some(e) => {
+                let spot = Spot::Pane(e.a.pane_id.clone());
+                self.input = Some((InputKind::Agent(spot, model::label(e)), String::new()));
+            }
+            None => self.say(Err("select an agent or worktree".into())),
+        }
+    }
+
+    /// `R`: name what the selected agent is for.
+    fn start_role(&mut self) {
+        match self.selected_entry() {
+            Some(e) => self.input = Some((InputKind::Role(e.a.pane_id.clone()), e.role.clone())),
+            None => self.say(Err("select an agent".into())),
+        }
+    }
+
     fn start_chat(&mut self) {
         let cwd = self.selected_repo().map(|i| self.repos[i].path.clone()).unwrap_or_else(config::root);
         self.input = Some((InputKind::Chat(cwd), String::new()));
@@ -917,9 +989,14 @@ impl App {
             InputKind::Chat(cwd) => {
                 lifecycle::new_chat(client.as_deref(), &text, cwd).map_err(|e| e.to_string())
             }
+            InputKind::Agent(spot, _) => self.add_agent(spot, &text),
+            InputKind::Role(pane) => state::set_role(pane, &text)
+                .map(|()| if text.trim().is_empty() { "role cleared".into() } else { format!("role set to {}", text.trim()) })
+                .map_err(|e| e.to_string()),
         };
         match &r {
             Err(_) => self.input = Some((kind, text)),
+            Ok(_) if matches!(kind, InputKind::Role(_)) => self.refresh(),
             // New windows take focus; leave the popup so the user lands in them.
             Ok(_) if !matches!(kind, InputKind::Reply) => self.leave(false),
             Ok(_) => {}
@@ -927,8 +1004,26 @@ impl App {
         self.say(r);
     }
 
+    fn add_agent(&self, spot: &Spot, role: &str) -> Result<String, String> {
+        let client = self.client.as_deref();
+        let r = match spot {
+            Spot::Pane(pane) => {
+                let Some(e) = self.entries.iter().find(|e| &e.a.pane_id == pane) else {
+                    return Err("that agent is gone".into());
+                };
+                let cwd = PathBuf::from(e.a.root.as_deref().unwrap_or(&e.a.cwd));
+                lifecycle::add_agent(client, lifecycle::Spot::Pane(pane, &e.p), &cwd, role)
+            }
+            Spot::Worktree(ri, wi) => {
+                let (repo, wt) = (&self.repos[*ri], &self.repos[*ri].worktrees[*wi]);
+                lifecycle::add_agent(client, lifecycle::Spot::Worktree(repo, wt), &wt.path, role)
+            }
+        };
+        r.map_err(|e| e.to_string())
+    }
+
     fn toggle_fold(&mut self) {
-        if let Some(Row { key: Key::Group(g), .. }) = self.list.selected().and_then(|i| self.rows.get(i)) {
+        if let Some(Row { key: Key::Group(g) | Key::Unit(g), .. }) = self.list.selected().and_then(|i| self.rows.get(i)) {
             let g = g.clone();
             if !self.toggled.remove(&g) {
                 self.toggled.insert(g);
@@ -980,6 +1075,11 @@ impl App {
             Some(Key::Agent(p)) => {
                 let p = p.clone();
                 self.jump_to(&p);
+            }
+            Some(Key::Unit(_)) => {
+                if let Some(p) = self.selected_entry().map(|e| e.a.pane_id.clone()) {
+                    self.jump_to(&p);
+                }
             }
             Some(Key::Group(_)) => self.toggle_fold(),
             Some(Key::Worktree(_)) => self.open_selected_worktree(),
@@ -1212,6 +1312,8 @@ impl App {
             KeyCode::Char('w') => self.start_worktree(),
             KeyCode::Char('c') => self.start_chat(),
             KeyCode::Char('x') => self.start_remove(),
+            KeyCode::Char('+') => self.start_agent(),
+            KeyCode::Char('R') => self.start_role(),
             KeyCode::Char('h') | KeyCode::Left if self.grid => self.move_agent(-1),
             KeyCode::Char('l') | KeyCode::Right if self.grid => self.move_agent(1),
             KeyCode::Char('j') | KeyCode::Down if self.grid => self.move_agent(self.grid_cols as isize),
@@ -1303,9 +1405,26 @@ impl App {
                         Span::styled("no agent · ⏎ opens a shell", Style::new().fg(FAINT)),
                     ]))
                 }
-                Kind::Agent { entry, show_label } => {
+                Kind::Unit { label, members, collapsed, shared } => {
+                    let mut spans = vec![
+                        Span::styled(if *collapsed { "  ▸ " } else { "  ▾ " }, Style::new().fg(ACCENT)),
+                        Span::styled(format!("{:<22}", fit(label, 21)), Style::new().fg(TEXT).add_modifier(Modifier::BOLD)),
+                    ];
+                    for &i in members {
+                        let st = self.entries[i].a.status;
+                        spans.push(Span::styled(st.glyph(), status_style(st)));
+                    }
+                    spans.push(Span::styled(format!("  {} agents", members.len()), dim()));
+                    if let Some(t) = shared.first() {
+                        let by: Vec<String> = t.by.iter().map(|n| format!("#{n}")).collect();
+                        let file = t.file.rsplit('/').next().unwrap_or(&t.file);
+                        let more = if shared.len() > 1 { format!(" +{} more", shared.len() - 1) } else { String::new() };
+                        spans.push(Span::styled(format!("   ⚡ {file} edited by {}{more}", by.join(" ")), Style::new().fg(ORANGE)));
+                    }
+                    ListItem::new(Line::from(spans))
+                }
+                Kind::Agent { entry, slot } => {
                     let e = &self.entries[*entry];
-                    let label = if *show_label { fit(&model::label(e), 21) } else { String::new() };
                     let task = e.a.task.clone().unwrap_or_default();
                     let what = match e.a.status {
                         Status::NeedsInput => e.a.message.clone().unwrap_or(task),
@@ -1316,13 +1435,29 @@ impl App {
                         Status::Idle => task,
                     };
                     let st = status_style(e.a.status);
-                    ListItem::new(Line::from(vec![
-                        Span::styled(format!("  {} ", e.a.status.glyph()), st),
-                        Span::styled(format!("{label:<22}"), Style::new().fg(TEXT)),
+                    let mut spans = match slot {
+                        // Under a unit header: tree branch, then "#2 tests" in the label column.
+                        Some(s) => {
+                            let n = format!("#{}", s.n);
+                            let role = fit(&e.role, 16usize.saturating_sub(n.chars().count()));
+                            vec![
+                                Span::styled(if s.last { "    ╰ " } else { "    ├ " }, Style::new().fg(FAINT)),
+                                Span::styled(format!("{} ", e.a.status.glyph()), st),
+                                Span::styled(n.clone(), Style::new().fg(TEXT).add_modifier(Modifier::BOLD)),
+                                Span::styled(format!("{:<w$}", format!(" {role}"), w = 18 - n.chars().count()), Style::new().fg(PURPLE)),
+                            ]
+                        }
+                        None => vec![
+                            Span::styled(format!("  {} ", e.a.status.glyph()), st),
+                            Span::styled(format!("{:<22}", fit(&model::label(e), 21)), Style::new().fg(TEXT)),
+                        ],
+                    };
+                    spans.extend([
                         Span::styled(format!("{:<12}", e.a.status.label()), st),
                         Span::styled(format!("{:>4}  ", age(now.saturating_sub(e.a.since))), Style::new().fg(FAINT)),
                         Span::styled(what, dim()),
-                    ]))
+                    ]);
+                    ListItem::new(Line::from(spans))
                 }
             })
             .collect();
@@ -1350,17 +1485,34 @@ impl App {
         if self.peek && !self.grid && self.pr_focus && self.pr_state.selected().is_some_and(|i| i < self.prs.len()) {
             self.render_pr_detail(f, peek);
         } else if self.peek && !self.grid {
+            let handle = self.selected_handle();
             let title = match self.selected_entry() {
-                Some(e) => Line::from(vec![
-                    Span::styled(format!(" {} ", e.a.status.glyph()), status_style(e.a.status)),
-                    Span::styled(
-                        if e.p.is_chat() { format!("{} ", model::chat_title(e)) } else { format!("{}:{} ", e.p.session, e.p.window_name) },
-                        Style::new().fg(TEXT),
-                    ),
-                    Span::styled(format!("{} ", mux::short_id(&e.a.pane_id)), Style::new().fg(FAINT)),
-                ]),
+                Some(e) => {
+                    let mut spans = vec![
+                        Span::styled(format!(" {} ", e.a.status.glyph()), status_style(e.a.status)),
+                        Span::styled(
+                            if e.p.is_chat() { format!("{} ", model::chat_title(e)) } else { format!("{}:{} ", e.p.session, e.p.window_name) },
+                            Style::new().fg(TEXT),
+                        ),
+                    ];
+                    if let Some((n, role)) = &handle {
+                        spans.push(Span::styled(format!("#{n} "), Style::new().fg(TEXT).add_modifier(Modifier::BOLD)));
+                        if !role.is_empty() {
+                            spans.push(Span::styled(format!("{role} "), Style::new().fg(PURPLE)));
+                        }
+                    }
+                    spans.push(Span::styled(format!("{} ", mux::short_id(&e.a.pane_id)), Style::new().fg(FAINT)));
+                    Line::from(spans)
+                }
                 None => Line::styled(" peek ", dim()),
             };
+            let files = self.files_lines(peek.width.saturating_sub(4) as usize);
+            let files_h = if files.is_empty() { 0 } else { files.len() as u16 + 2 };
+            let [peek, files_area] = Layout::vertical([Constraint::Min(3), Constraint::Length(files_h)]).areas(peek);
+            if !files.is_empty() {
+                let block = panel().title(Span::styled(" files edited here ", Style::new().fg(DIM)));
+                f.render_widget(Paragraph::new(files).block(block), files_area);
+            }
             self.peek_area = peek;
             let mut block = panel().title(title);
             if self.peek_scroll > 0 {
@@ -1396,6 +1548,31 @@ impl App {
 
         self.render_footer(f, foot);
         self.render_picker(f);
+    }
+
+    /// Files edited by the agents sharing the selected agent's worktree or chat, shared ones
+    /// first; empty unless it has more than one agent.
+    fn files_lines(&self, width: usize) -> Vec<Line<'static>> {
+        const MAX: usize = 6;
+        let Some(e) = self.selected_entry() else { return vec![] };
+        let units = model::units(&self.entries);
+        let Some(members) = units.get(&model::unit_of(e)).filter(|m| m.len() > 1) else { return vec![] };
+        let all = model::touched(&self.entries, members);
+        let mut lines: Vec<Line> = all
+            .iter()
+            .take(MAX)
+            .map(|t| {
+                let by: Vec<String> = t.by.iter().map(|n| format!("#{n}")).collect();
+                let by = by.join(" ");
+                let file = fit(&t.file, width.saturating_sub(by.chars().count() + 4));
+                let mark = if t.by.len() > 1 { Span::styled("⚡ ", Style::new().fg(ORANGE)) } else { Span::raw("  ") };
+                Line::from(vec![mark, Span::styled(format!("{file}  "), Style::new().fg(TEXT)), Span::styled(by, dim())])
+            })
+            .collect();
+        if all.len() > MAX {
+            lines.push(Line::styled(format!("  +{} more", all.len() - MAX), Style::new().fg(FAINT)));
+        }
+        lines
     }
 
     /// The selected PR's title and description, in place of the agent peek.
@@ -1543,6 +1720,7 @@ impl App {
                     (" force remove ", format!("{l} has uncommitted or untracked files; discard them and close its session"))
                 }
                 Confirm::Chat(_, l) => (" kill chat ", format!("{l} and its session")),
+                Confirm::Agent(_, l) => (" close agent ", format!("{l} (its pane only)")),
             };
             Line::from(vec![
                 Span::styled(title, Style::new().fg(Color::Black).bg(RED).add_modifier(Modifier::BOLD)),
@@ -1558,6 +1736,11 @@ impl App {
                 ),
                 InputKind::Worktree(i) => format!("new branch in {}", self.repos[*i].name),
                 InputKind::Chat(_) => "new chat topic".to_string(),
+                InputKind::Agent(_, l) => format!("add agent to {l} · role (optional)"),
+                InputKind::Role(_) => match self.selected_handle() {
+                    Some((n, _)) => format!("role for #{n}"),
+                    None => "role".to_string(),
+                },
             };
             let mut spans = prompt(label, buf);
             if let Some((Err(e), _)) = fresh {
@@ -1579,7 +1762,8 @@ impl App {
             // Most useful first; what doesn't fit the width is dropped from the end, never the way out.
             let leave = if self.persistent { "back" } else { "quit" };
             let keys = [
-                ("⏎", "jump"), ("a", "allow"), ("d", "deny"), ("r", "reply"), ("w", "worktree"), ("c", "chat"), ("x", "kill/remove"),
+                ("⏎", "jump"), ("a", "allow"), ("d", "deny"), ("r", "reply"), ("+", "agent"), ("w", "worktree"), ("c", "chat"),
+                ("x", "kill/remove"), ("R", "role"),
                 ("m", "grid"), ("/", "filter"), ("P", "pin"), ("f", "PRs"), ("p", "peek"), ("tab", "fold"), ("n", "next"),
             ];
             let width = |k: &str, d: &str| k.chars().count() + 2 + d.chars().count() + 3;
@@ -1606,12 +1790,12 @@ impl App {
 
     /// Mission control: a live tile per agent. Read-only; enter jumps in.
     fn render_grid(&mut self, f: &mut Frame, area: Rect) {
-        let agents: Vec<(usize, usize)> = self
+        let agents: Vec<(usize, usize, Option<model::Slot>)> = self
             .rows
             .iter()
             .enumerate()
             .filter_map(|(ri, r)| match r.kind {
-                Kind::Agent { entry, .. } => Some((ri, entry)),
+                Kind::Agent { entry, slot } => Some((ri, entry, slot)),
                 _ => None,
             })
             .collect();
@@ -1623,7 +1807,7 @@ impl App {
         let nrows = agents.len().div_ceil(cols);
         self.grid_cols = cols;
         let row_areas = Layout::vertical((0..nrows).map(|_| Constraint::Ratio(1, nrows as u32))).split(area);
-        for (n, &(ri, ei)) in agents.iter().enumerate() {
+        for (n, &(ri, ei, slot)) in agents.iter().enumerate() {
             let cell = Layout::horizontal((0..cols).map(|_| Constraint::Ratio(1, cols as u32))).split(row_areas[n / cols])[n % cols];
             let e = &self.entries[ei];
             let selected = Some(ri) == self.list.selected();
@@ -1632,6 +1816,10 @@ impl App {
                 model::chat_title(e)
             } else {
                 format!("{}/{}", e.a.repo.as_deref().unwrap_or("?"), e.a.branch.as_deref().unwrap_or(&e.p.window_name))
+            };
+            let name = match slot {
+                Some(s) => format!("{name} {}", model::handle(s.n, &e.role)),
+                None => name,
             };
             let color = status_color(e.a.status);
             let title = if selected {

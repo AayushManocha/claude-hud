@@ -47,6 +47,15 @@ pub struct AgentState {
     /// Unix seconds when `status` last changed.
     pub since: u64,
     pub updated: u64,
+    /// Top of the worktree the agent works in; agents sharing it are shown together.
+    #[serde(default)]
+    pub root: Option<String>,
+    /// Unix seconds when this session's record was created; orders agents in a worktree (#1, #2…).
+    #[serde(default)]
+    pub started: u64,
+    /// Files this session has edited or written, oldest first.
+    #[serde(default)]
+    pub edits: Vec<String>,
 }
 
 pub fn now() -> u64 {
@@ -95,6 +104,36 @@ pub fn save(s: &AgentState) -> Result<()> {
 
 pub fn remove(pane_id: &str) {
     let _ = std::fs::remove_file(path_for(pane_id));
+}
+
+/// Roles name a pane's job ("tests", "review"), so they belong to the pane and outlive the
+/// session in it. Kept apart from the agent record, which the hooks rewrite.
+fn role_path(pane_id: &str) -> PathBuf {
+    let file = path_for(pane_id);
+    state_dir().join("roles").join(file.file_name().unwrap_or_default()).with_extension("txt")
+}
+
+pub fn role(pane_id: &str) -> String {
+    std::fs::read_to_string(role_path(pane_id)).map(|s| s.trim().to_string()).unwrap_or_default()
+}
+
+/// An empty role clears it.
+pub fn set_role(pane_id: &str, role: &str) -> Result<()> {
+    let path = role_path(pane_id);
+    let role = role.trim();
+    if role.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return Ok(());
+    }
+    std::fs::create_dir_all(state_dir().join("roles")).context("creating roles dir")?;
+    std::fs::write(path, role)?;
+    Ok(())
+}
+
+/// The pane is gone: drop its record and its role.
+pub fn forget(pane_id: &str) {
+    remove(pane_id);
+    let _ = std::fs::remove_file(role_path(pane_id));
 }
 
 pub fn load_all() -> Vec<AgentState> {

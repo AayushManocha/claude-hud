@@ -31,6 +31,27 @@ fn describe_tool(input: &Value, name: &str) -> String {
     truncate(&format!("{name} {detail}"), 80)
 }
 
+/// The file a successful edit tool call changed.
+fn edited_file(input: &Value) -> Option<&str> {
+    let ti = input.get("tool_input")?;
+    match str_field(input, "tool_name")? {
+        "Edit" | "MultiEdit" | "Write" => str_field(ti, "file_path"),
+        "NotebookEdit" => str_field(ti, "notebook_path"),
+        _ => None,
+    }
+}
+
+const MAX_EDITS: usize = 200;
+
+/// Most recent last; a file edited again moves to the end.
+fn record_edit(edits: &mut Vec<String>, file: &str) {
+    edits.retain(|f| f != file);
+    edits.push(file.to_string());
+    if edits.len() > MAX_EDITS {
+        edits.remove(0);
+    }
+}
+
 /// What a Notification means for agent status. `None` leaves it unchanged.
 fn notification_status(input: &Value) -> Option<Status> {
     match str_field(input, "notification_type") {
@@ -97,12 +118,16 @@ fn handle(hook: &str) -> Result<()> {
         message: None,
         since: now,
         updated: now,
+        root: None,
+        started: now,
+        edits: vec![],
     });
 
-    if s.cwd != cwd || s.repo.is_none() || matches!(hook, "session-start" | "user-prompt-submit") {
+    if s.cwd != cwd || s.repo.is_none() || s.root.is_none() || matches!(hook, "session-start" | "user-prompt-submit") {
         s.cwd = cwd.clone();
         s.repo = git::repo_name(&cwd);
         s.branch = git::branch(&cwd);
+        s.root = git::toplevel(&cwd);
     }
 
     let new_status = match hook {
@@ -124,6 +149,9 @@ fn handle(hook: &str) -> Result<()> {
         }
         "post-tool-use" => {
             s.message = None;
+            if let Some(f) = edited_file(&input) {
+                record_edit(&mut s.edits, f);
+            }
             Status::Working
         }
         "notification" => {
@@ -158,4 +186,22 @@ fn handle(hook: &str) -> Result<()> {
         notify::needs_input(&s);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_edited_files_once_newest_last() {
+        let edit = |tool: &str, k: &str, f: &str| serde_json::json!({"tool_name": tool, "tool_input": {k: f}});
+        assert_eq!(edited_file(&edit("Edit", "file_path", "/r/a.rs")), Some("/r/a.rs"));
+        assert_eq!(edited_file(&edit("NotebookEdit", "notebook_path", "/r/n.ipynb")), Some("/r/n.ipynb"));
+        assert_eq!(edited_file(&edit("Read", "file_path", "/r/a.rs")), None);
+        let mut v = vec![];
+        for f in ["/a", "/b", "/a"] {
+            record_edit(&mut v, f);
+        }
+        assert_eq!(v, ["/b", "/a"]);
+    }
 }
